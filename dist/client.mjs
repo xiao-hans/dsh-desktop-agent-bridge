@@ -19762,13 +19762,20 @@ function date4(params) {
 var PACKAGE_NAME = "dsh-agent-collaboration";
 var id = external_exports.string().min(1).max(200);
 var clientId = external_exports.string().regex(/^[a-z][a-z0-9_-]{0,47}$/);
+var PERMISSION_MODES = ["workspace-write", "danger-full-access"];
+var permissionMode = external_exports.enum(PERMISSION_MODES);
+function normalizePermissionModes(modes) {
+  const list = (modes ?? ["workspace-write"]).slice().sort();
+  return list.length ? list : ["workspace-write"];
+}
 var clientPolicySchema = external_exports.object({
   id: clientId,
   label: external_exports.string().min(1).max(80),
   workspaceIds: external_exports.array(id).max(100),
   presets: external_exports.array(external_exports.string().max(200)).max(100),
   models: external_exports.array(id).max(200),
-  parentInteractions: external_exports.boolean().default(false)
+  parentInteractions: external_exports.boolean().default(false),
+  permissionModes: external_exports.array(permissionMode).max(PERMISSION_MODES.length).default(["workspace-write"]).transform(normalizePermissionModes)
 }).strict();
 var actionSchema = external_exports.discriminatedUnion("type", [
   external_exports.object({ type: external_exports.literal("takeover"), sessionId: id }).strict(),
@@ -19790,7 +19797,8 @@ var startSchema = external_exports.object({
   workspaceId: id,
   preset: external_exports.string().max(200),
   selection: selectionSchema,
-  sessionId: id.optional()
+  sessionId: id.optional(),
+  permissionMode: permissionMode.optional()
 }).strict();
 var messageSchema = external_exports.object({
   requestId: id,
@@ -20321,9 +20329,23 @@ function ClientPolicy({ client, state, store }) {
           })),
           onChange: (value) => change("models", value)
         }
+      ),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+        ChoiceList,
+        {
+          legend: "\u5141\u8BB8\u7684\u4F1A\u8BDD\u6743\u9650\u6A21\u5F0F",
+          selected: draft.permissionModes ?? ["workspace-write"],
+          disabled: state.busy,
+          options: PERMISSION_MODES.map((mode) => ({
+            id: mode,
+            label: mode,
+            description: mode === "workspace-write" ? "\u5DE5\u4F5C\u533A\u5199\u5165 + \u4EBA\u5DE5\u5BA1\u6279\uFF08\u9ED8\u8BA4\uFF0C\u6700\u4E25\u683C\uFF09" : "\u5B8C\u6574\u8BBF\u95EE\uFF1A\u8DF3\u8FC7\u5DE5\u4F5C\u533A\u9650\u5236\u6821\u9A8C\uFF0C\u4EC5\u5728\u5B8C\u5168\u4FE1\u4EFB\u8BE5 Agent \u65F6\u52FE\u9009"
+          })),
+          onChange: (value) => change("permissionModes", value.length ? value : ["workspace-write"])
+        }
       )
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "dsh-ac-hint", children: "\u4EC5\u53EF\u9009\u62E9\u5DF2\u6388\u6743\u8D44\u6E90\uFF1B\u66F4\u6539\u6388\u6743\u7C7B\u522B\u65F6\u4F1A\u79FB\u9664\u5176\u4E2D\u5F53\u524D\u4E0D\u53EF\u7528\u7684\u8D44\u6E90\u3002\u7A7A\u5217\u8868\u8868\u793A\u4E0D\u6388\u6743\uFF1B\u6A21\u578B\u4E0E\u601D\u8003\u5F3A\u5EA6\u7531 Agent \u5728\u521B\u5EFA\u4EFB\u52A1\u65F6\u9009\u62E9\u3002" }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "dsh-ac-hint", children: "\u4EC5\u53EF\u9009\u62E9\u5DF2\u6388\u6743\u8D44\u6E90\uFF1B\u66F4\u6539\u6388\u6743\u7C7B\u522B\u65F6\u4F1A\u79FB\u9664\u5176\u4E2D\u5F53\u524D\u4E0D\u53EF\u7528\u7684\u8D44\u6E90\u3002\u7A7A\u5217\u8868\u8868\u793A\u4E0D\u6388\u6743\uFF1B\u6A21\u578B\u4E0E\u601D\u8003\u5F3A\u5EA6\u7531 Agent \u5728\u521B\u5EFA\u4EFB\u52A1\u65F6\u9009\u62E9\u3002\u653E\u5F00 workspace-write \u4E4B\u5916\u7684\u6743\u9650\u6A21\u5F0F\u524D\uFF0C\u8BF7\u786E\u8BA4\u4F60\u4FE1\u4EFB\u8BE5\u5916\u90E8 Agent\u3002" }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: "dsh-ac-toggle", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
         "input",

@@ -1,10 +1,16 @@
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, writeFile, rename, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
-import { VERSION, actionSchema, clientPolicySchema, startSchema, messageSchema, interactionResponseSchema } from './protocol.mjs';
+import { VERSION, actionSchema, clientPolicySchema, startSchema, messageSchema, interactionResponseSchema, normalizePermissionModes, permissionModesChanged } from './protocol.mjs';
 
 const finished = new Set(['completed', 'failed', 'cancelled', 'blocked']);
 export function fail(code, message) { throw Object.assign(new Error(message), { code }); }
+export function clientPermissionSummary(client) {
+  const modes = normalizePermissionModes(client?.permissionModes);
+  const approvals = modes.includes('workspace-write') ? 'workspace-write: approvals human only'
+    : 'workspace-write not authorized';
+  return `${approvals}; modes: ${modes.join(', ')}`;
+}
 const digest = value => createHash('sha256').update(value).digest('hex');
 const fingerprint = value => digest(JSON.stringify(value));
 export async function atomicJson(file, value) {
@@ -44,6 +50,11 @@ export class Broker {
     }
     this.state.interactionReplies ??= [];
     if (!Array.isArray(this.state.interactionReplies)) fail('STATE_INVALID', '审批回复记录格式无效。');
+    for (const client of this.state.clients) {
+      client.permissionModes ??= ['workspace-write'];
+    }
+    this.adapter.setPermissionScope?.(principal =>
+      normalizePermissionModes(this.state.clients.find(c => c.id === principal)?.permissionModes));
     this.adapter.setInteractionScope?.(sessionId => {
       const session = this.state.sessions.find(item => item.sessionId === sessionId);
       const client = this.state.clients.find(item => item.id === session?.principal);
@@ -102,7 +113,7 @@ export class Broker {
       workspaces: all.workspaces.filter(w => client.workspaceIds.includes(w.workspaceId)),
       presets: all.presets.filter(p => client.presets.includes(p.id)),
       models: all.models.filter(m => client.models.includes(`${m.provider}/${m.model}`)),
-      permission: 'workspace-write; approvals: human only',
+      permission: clientPermissionSummary(client),
       parentInteractions: client.parentInteractions === true,
     };
   }
@@ -115,6 +126,10 @@ export class Broker {
         return this.result(existing);
       }
       const catalog = await this.catalog(principal);
+      const clientModes = normalizePermissionModes(this.client(principal).permissionModes);
+      const effectiveMode = input.permissionMode
+        ?? (clientModes.includes('workspace-write') ? 'workspace-write' : clientModes[0]);
+      if (!clientModes.includes(effectiveMode)) fail('PERMISSION_MODE_DENIED', '用户未向该客户端授权此会话权限模式。');
       const workspace = catalog.workspaces.find(w => w.workspaceId === input.workspaceId);
       if (!workspace) fail('WORKSPACE_DENIED', '该工作区未授权。');
       if (!catalog.presets.some(p => p.id === input.preset)) fail('PRESET_DENIED', '该能力包未授权。');
@@ -149,11 +164,13 @@ export class Broker {
           const created = await this.adapter.create({
             workspaceId: input.workspaceId, preset: input.preset,
             selection: input.selection, title: `[${this.client(principal).label}] ${run.title}`,
+            principal, permissionMode: effectiveMode,
           });
           run.sessionId = created.sessionId;
           session = {
             sessionId: run.sessionId, principal, title: run.title, workspace: workspace.path,
             workspaceId: input.workspaceId, preset: input.preset, selection: input.selection,
+            permissionMode: effectiveMode,
             control: 'agent', status: 'queued',
           };
           this.state.sessions.push(session);
@@ -418,8 +435,8 @@ export class Broker {
       sessions: this.state.sessions,
       runs: this.state.runs.map(({ task, fingerprint, ...r }) => r),
       catalog: await this.adapter.catalog(),
-      policy: { clients: this.state.clients.map(({ id, label, workspaceIds, presets, models, parentInteractions }) =>
-        clientPolicySchema.parse({ id, label, workspaceIds, presets, models, parentInteractions })) },
+      policy: { clients: this.state.clients.map(({ id, label, workspaceIds, presets, models, parentInteractions, permissionModes }) =>
+        clientPolicySchema.parse({ id, label, workspaceIds, presets, models, parentInteractions, permissionModes })) },
     };
   }
   async action(raw) {
@@ -432,7 +449,7 @@ export class Broker {
         await atomicJson(connectionFile, { id: request.id, token, endpointFile: join(this.directory, 'endpoint.json') });
         this.state.clients.push({
           id: request.id, label: request.label, tokenHash: digest(token), connectionFile,
-          workspaceIds: [], presets: [], models: [],
+          workspaceIds: [], presets: [], models: [], permissionModes: ['workspace-write'],
         });
         await this.save();
         return { connectionFile };
@@ -458,7 +475,10 @@ export class Broker {
           if (JSON.stringify(clientPolicySchema.parse({
             id: client.id, label: client.label, workspaceIds: client.workspaceIds,
             presets: client.presets, models: client.models, parentInteractions: client.parentInteractions,
-          })) !== JSON.stringify(policy)) client.interactionEpoch = (client.interactionEpoch ?? 0) + 1;
+            permissionModes: client.permissionModes,
+          })) !== JSON.stringify(policy) || permissionModesChanged(client.permissionModes, policy.permissionModes)) {
+            client.interactionEpoch = (client.interactionEpoch ?? 0) + 1;
+          }
           Object.assign(client, policy);
         }
         await this.save();
@@ -472,7 +492,8 @@ export class Broker {
             !client.models.includes(`${info.selection.provider}/${info.selection.model}`)) {
           fail('RESOURCE_DENIED', '请先授权该会话现有的工作区、能力包和模型。');
         }
-        this.state.sessions.push({ ...info, sessionId: request.sessionId, principal: client.id, control: 'agent' });
+        this.state.sessions.push({ ...info, sessionId: request.sessionId, principal: client.id,
+          permissionMode: info.permissionMode ?? 'workspace-write', control: 'agent' });
         await this.save();
         return { adopted: true };
       }

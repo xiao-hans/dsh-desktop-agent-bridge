@@ -576,3 +576,48 @@ test('refresh preserves still-owned native requests without declining them and s
   await adapter.dispose();
   assert(fixture.peers.every(peer => peer.disposed));
 });
+
+test('an authorized non-default permission mode passes send while other principals stay denied', async () => {
+  const fixture = harness();
+  const adapter = createHostAdapter(fixture.ctx);
+  adapter.setPermissionScope(principal =>
+    principal === 'trusted' ? ['danger-full-access', 'workspace-write'] : ['workspace-write']);
+  fixture.permissions.set('session-1', 'danger-full-access');
+  const message = { text: '请核实', source: { principal: 'trusted' }, messageId: 'message-1' };
+  assert.equal(await adapter.send('session-1', message), 'message-1');
+  await assert.rejects(
+    adapter.send('session-1', { text: '另一请求', source: { principal: 'other' }, messageId: 'message-2' }),
+    { code: 'UNSAFE_SESSION_PERMISSIONS' });
+  await adapter.dispose();
+});
+
+test('create keeps the human-approval guard for the default mode and honors an authorized mode', async () => {
+  const fixture = harness();
+  const adapter = createHostAdapter(fixture.ctx);
+  adapter.setPermissionScope(principal =>
+    principal === 'trusted' ? ['danger-full-access', 'workspace-write'] : ['workspace-write']);
+  fixture.ctx.permissionPresets.resolve = () => ({ sandbox: 'danger-full-access', approval: 'never' });
+  await assert.rejects(adapter.create({ workspaceId: 'workspace-1', principal: 'other' }),
+    { code: 'HOST_INCOMPATIBLE' });
+  assert.ok(!fixture.calls.some(([name]) => name === 'session.create'));
+  const created = await adapter.create({
+    workspaceId: 'workspace-1', preset: 'standard',
+    selection: { provider: 'local', model: 'model-a' }, principal: 'trusted',
+    permissionMode: 'danger-full-access',
+  });
+  assert.equal(created.sessionId, 'session-1');
+  assert.equal(fixture.permissions.get('session-1'), 'danger-full-access');
+  await adapter.dispose();
+});
+
+test('create rejects a permission mode the client was not granted', async () => {
+  const fixture = harness();
+  const adapter = createHostAdapter(fixture.ctx);
+  await assert.rejects(adapter.create({
+    workspaceId: 'workspace-1', preset: 'standard',
+    selection: { provider: 'local', model: 'model-a' }, principal: 'codex',
+    permissionMode: 'danger-full-access',
+  }), { code: 'UNSAFE_SESSION_PERMISSIONS' });
+  assert.ok(!fixture.calls.some(([name]) => name === 'session.create'));
+  await adapter.dispose();
+});

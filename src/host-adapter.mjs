@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { normalizePermissionModes } from './protocol.mjs';
 
 function fail(message, code = 'HOST_INCOMPATIBLE') {
   throw Object.assign(new Error(message), { code });
@@ -102,6 +103,18 @@ export function createHostAdapter(ctx) {
     }
   }
 
+  // Per-principal permission allowlist supplied by the broker (client policy). Clients that were
+  // never granted a non-default mode keep the original workspace-write-only behaviour.
+  let permissionScope = () => normalizePermissionModes(undefined);
+  function authorizedModes(principal) {
+    return normalizePermissionModes(principal ? permissionScope(principal) : undefined);
+  }
+  // The workspace-write preset is only safe when the host really confines writes and asks a human.
+  function requirePresetSafety(mode) {
+    if (mode !== 'workspace-write') return;
+    requireHumanPermissions();
+  }
+
   async function catalog() {
     const [workspaceFrame, modelCatalog, presetCatalog, sessionCatalog] = await Promise.all([
       first('workspace', 'follow', {}),
@@ -134,8 +147,13 @@ export function createHostAdapter(ctx) {
     return { workspaceId: workspace.workspaceId, path: workspace.path, title: workspace.title };
   }
 
-  async function create({ workspaceId, preset, selection, title }) {
-    requireHumanPermissions();
+  async function create({ workspaceId, preset, selection, title, principal, permissionMode }) {
+    const modes = authorizedModes(principal);
+    const requested = permissionMode ?? (modes.includes('workspace-write') ? 'workspace-write' : modes[0]);
+    if (!modes.includes(requested)) {
+      fail('Select a permission mode the user has explicitly authorized for this client.', 'UNSAFE_SESSION_PERMISSIONS');
+    }
+    requirePresetSafety(requested);
     const available = await catalog();
     if (!available.workspaces.some(workspace => workspace.workspaceId === workspaceId)) {
       fail('Choose an existing DSH workspace.', 'INVALID_WORKSPACE');
@@ -149,8 +167,8 @@ export function createHostAdapter(ctx) {
       request: { workspaceId, agentPreset: presetId },
     });
     const agent = await agentFor(created.sessionId);
-    ctx.permissionPresets.set(agent.session, 'workspace-write');
-    if (ctx.permissionPresets.current(agent.session) !== 'workspace-write') {
+    ctx.permissionPresets.set(agent.session, requested);
+    if (ctx.permissionPresets.current(agent.session) !== requested) {
       fail('DSH did not retain the required permission preset.');
     }
     ctx.sessionController.agents.selectForNextRequest(agent, sessionSelection);
@@ -249,10 +267,12 @@ export function createHostAdapter(ctx) {
     if (!['queue', 'steer'].includes(mode)) fail('Unsupported message delivery mode.', 'INVALID_MESSAGE');
     if (typeof source?.principal !== 'string' || !source.principal) fail('An authenticated source principal is required.', 'INVALID_PRINCIPAL');
     const agent = await agentFor(sessionId);
-    requireHumanPermissions();
-    if (ctx.permissionPresets.current(agent.session) !== 'workspace-write') {
-      fail('Select workspace-write with human approval in this DSH session before handing it to an external agent.', 'UNSAFE_SESSION_PERMISSIONS');
+    const modes = authorizedModes(source.principal);
+    const current = ctx.permissionPresets.current(agent.session);
+    if (!modes.includes(current)) {
+      fail('This DSH session runs in a permission mode the user has not authorized for this client. Select an allowed preset (default: workspace-write with human approval) before handing it to an external agent.', 'UNSAFE_SESSION_PERMISSIONS');
     }
+    requirePresetSafety(current);
     const snapshot = await history(sessionId);
     const accepted = snapshot.events.flatMap(event => event.type === 'agent/inbox/spliced'
       ? event.data.inserted : event.type === 'user/message' ? [event.data] : []);
@@ -316,6 +336,11 @@ export function createHostAdapter(ctx) {
   function setInteractionScope(predicate) {
     if (typeof predicate !== 'function') fail('An interaction scope predicate is required.', 'INVALID_INTERACTION_SCOPE');
     interactionScope = predicate;
+  }
+
+  function setPermissionScope(provider) {
+    if (typeof provider !== 'function') fail('A permission scope provider is required.', 'INVALID_PERMISSION_SCOPE');
+    permissionScope = provider;
   }
 
   function hasInteractionScope(sessionId) {
@@ -542,6 +567,6 @@ export function createHostAdapter(ctx) {
   }
 
   return { catalog, createWorkspace, create, inspect, send, takeover, cancel, selectModel, adopt,
-    setInteractionScope, refreshInteractionScope, ensureInteractions, listInteractions,
+    setInteractionScope, setPermissionScope, refreshInteractionScope, ensureInteractions, listInteractions,
     validateInteractionResponse, respondInteraction, dispose, uiStatus };
 }

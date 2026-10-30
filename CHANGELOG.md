@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 权限模式改为按身份显式授权：客户端策略新增 `permissionModes`（默认仅 `workspace-write`）。用户可在桌面协作设置中为受信任的客户端勾选 `danger-full-access`；只有被授权的模式才允许创建或续接会话，未授权一律返回 `UNSAFE_SESSION_PERMISSIONS`，broker 层在建会话前返回 `PERMISSION_MODE_DENIED`。其余护栏（会话归属、用户接管、工作区/能力包/模型白名单、幂等冲突、父 Agent 代审批开关）不变。
+
 - 新增供外部 Agent 使用的标准 Skill，说明 MCP 任务分派、续聊、状态判断和真人审批转交；补充 Codex、Hermes 与 Grok Bot 的获取方式。
 
 ## 0.1.1 — DSH 插件页安装

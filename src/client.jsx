@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useSyncExternalStore } from 'react';
-import { clientDescriptors, PACKAGE_NAME } from './protocol.mjs';
+import { clientDescriptors, PACKAGE_NAME, PERMISSION_MODES } from './protocol.mjs';
 import css from './client.css';
 
 const PANEL_ID = 'agent-collaboration';
@@ -238,8 +238,12 @@ function ClientPolicy({ client, state, store }) {
         options={(catalog.models || []).map(row => ({ id: `${row.provider}/${row.model}`, label: row.label || row.model,
           description: `${row.provider}/${row.model}；思考强度：${row.reasoningEfforts?.join('、') || '模型默认'}` }))}
         onChange={value => change('models', value)} />
+      <ChoiceList legend="允许的会话权限模式" selected={draft.permissionModes ?? ['workspace-write']} disabled={state.busy}
+        options={PERMISSION_MODES.map(mode => ({ id: mode, label: mode,
+          description: mode === 'workspace-write' ? '工作区写入 + 人工审批（默认，最严格）' : '完整访问：跳过工作区限制校验，仅在完全信任该 Agent 时勾选' }))}
+        onChange={value => change('permissionModes', value.length ? value : ['workspace-write'])} />
     </div>
-    <p className="dsh-ac-hint">仅可选择已授权资源；更改授权类别时会移除其中当前不可用的资源。空列表表示不授权；模型与思考强度由 Agent 在创建任务时选择。</p>
+    <p className="dsh-ac-hint">仅可选择已授权资源；更改授权类别时会移除其中当前不可用的资源。空列表表示不授权；模型与思考强度由 Agent 在创建任务时选择。放开 workspace-write 之外的权限模式前，请确认你信任该外部 Agent。</p>
     <label className="dsh-ac-toggle">
       <input type="checkbox" checked={Boolean(draft.parentInteractions)} disabled={state.busy}
         aria-describedby={`dsh-ac-parent-interactions-${client.id}`}

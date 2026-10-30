@@ -11,6 +11,7 @@ async function fixture(t) {
   await Promise.all(projects.map(path => mkdir(path)));
   const views = new Map(), calls = [], interactions = new Map();
   let interactionScope;
+  let permissionScope;
   const append = (id, type, data) => {
     const view = views.get(id);
     view.events.push({ seq: ++view.lastSeq, type, data });
@@ -49,6 +50,7 @@ async function fixture(t) {
     async selectModel(sessionId, input) { calls.push({ type: 'selectModel', sessionId, input }); },
     async ensureInteractions() {},
     setInteractionScope(predicate) { interactionScope = predicate; },
+    setPermissionScope(provider) { permissionScope = provider; },
     async listInteractions(sessionId) { return structuredClone(interactions.get(sessionId) ?? []); },
     validateInteractionResponse() {},
     async respondInteraction(sessionId, id, response) {
@@ -84,6 +86,7 @@ async function fixture(t) {
   });
   return {
     get broker() { return broker; }, get interactionScope() { return interactionScope; },
+    get permissionScope() { return permissionScope; },
     adapter, calls, views, tokens, policies, input, append, finish, interactions,
     async restart() {
       await broker.close();
@@ -556,4 +559,45 @@ test('native resolution and completed tasks invalidate pending parent requests',
   f.finish(f.run.sessionId);
   await assert.rejects(f.broker.interactions('codex', f.run.runId), { code: 'INTERACTION_RUN_INACTIVE' });
   assert.equal(f.calls.filter(call => call.type === 'interaction').length, 0);
+});
+
+test('explicitly granted permission modes flow to the adapter; ungranted modes fail before creation', async t => {
+  const f = await fixture(t);
+  assert.deepEqual(f.permissionScope('codex'), ['workspace-write']);
+  await f.broker.action({ type: 'save-policy', clients: [
+    { ...f.policies[0], permissionModes: ['danger-full-access', 'workspace-write'] },
+    { ...f.policies[1], permissionModes: ['danger-full-access'] },
+  ] });
+  assert.deepEqual(f.permissionScope('codex'), ['danger-full-access', 'workspace-write']);
+  assert.deepEqual(f.permissionScope('hermes'), ['danger-full-access']);
+  assert.match((await f.broker.catalog('hermes')).permission, /modes: danger-full-access/);
+
+  await f.broker.start('hermes', f.input('mode-task', { permissionMode: 'danger-full-access' }));
+  const created = f.calls.find(call => call.type === 'create');
+  assert.equal(created.input.permissionMode, 'danger-full-access');
+  assert.equal(created.input.principal, 'hermes');
+  assert.equal(f.broker.state.sessions.find(s => s.sessionId === created.sessionId).permissionMode, 'danger-full-access');
+
+  // 只授权 danger-full-access 时，默认请求回退到该授权模式（不落回未授权的 workspace-write）。
+  await f.broker.start('hermes', f.input('mode-default-fallback'));
+  const fallback = f.calls.filter(call => call.type === 'create')[1];
+  assert.equal(fallback.input.permissionMode, 'danger-full-access');
+  // 请求了未被授权的模式：broker 在建会话前拒绝（先把 codex 收回默认授权）。
+  await f.broker.action({ type: 'save-policy', clients: [
+    { ...f.policies[0], permissionModes: ['workspace-write'] }, f.policies[1],
+  ] });
+  await assert.rejects(f.broker.start('codex', f.input('mode-denied', { permissionMode: 'danger-full-access' })),
+    { code: 'PERMISSION_MODE_DENIED' });
+  assert.equal(f.calls.filter(call => call.type === 'create').length, 2);
+  // 未知名模式在 schema 层就拒绝，不进入 broker 决策。
+  await assert.rejects(f.broker.start('codex', f.input('mode-invalid', { permissionMode: 'invented-mode' })),
+    { name: 'ZodError' });
+  assert.equal(f.calls.filter(call => call.type === 'create').length, 2);
+});
+
+test('clients default to workspace-write when policies omit permissionModes', async t => {
+  const f = await fixture(t);
+  assert.deepEqual(f.broker.client('codex').permissionModes, ['workspace-write']);
+  const snapshot = await f.broker.snapshot();
+  assert.deepEqual(snapshot.policy.clients.find(c => c.id === 'codex').permissionModes, ['workspace-write']);
 });

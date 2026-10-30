@@ -4,7 +4,7 @@
 
 Delegate work from Codex, Hermes, Grok Bot, or another MCP client to an **already running DeepSeek Harness desktop application**. Watch native conversations, add instructions, approve operations, take control, or stop work in the same DSH window.
 
-This is an independent third-party plugin, not affiliated with DeepSeek AI. Version `0.1.1` is a preview. **Windows with DSH `0.2.1-rc.2`** is the verified host combination; other systems and DSH versions are unverified.
+This is an independent third-party plugin, not affiliated with DeepSeek AI. Version `0.1.2` is a preview. **Windows with DSH `0.2.1-rc.2`** is the verified host combination; other systems and DSH versions are unverified.
 
 **Local stdio connections require no domain, server, or public service.** A cloud parent agent that cannot reach a local process needs a reachable HTTPS endpoint. A managed tunnel or self-hosted HTTPS can provide it; buying a domain or VPS is not required. Managed tunnels are an optional deployment suggestion, not an integrated or tested one-click feature. Default installation configures only the local plugin; it installs no new service, creates no account, and initiates no paid service.
 

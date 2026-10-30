@@ -38775,16 +38775,23 @@ var EMPTY_COMPLETION_RESULT = {
 
 // src/protocol.mjs
 var PACKAGE_NAME = "dsh-agent-collaboration";
-var VERSION = "0.1.1";
+var VERSION = "0.1.2";
 var id = external_exports.string().min(1).max(200);
 var clientId = external_exports.string().regex(/^[a-z][a-z0-9_-]{0,47}$/);
+var PERMISSION_MODES = ["workspace-write", "danger-full-access"];
+var permissionMode = external_exports.enum(PERMISSION_MODES);
+function normalizePermissionModes(modes) {
+  const list = (modes ?? ["workspace-write"]).slice().sort();
+  return list.length ? list : ["workspace-write"];
+}
 var clientPolicySchema = external_exports.object({
   id: clientId,
   label: external_exports.string().min(1).max(80),
   workspaceIds: external_exports.array(id).max(100),
   presets: external_exports.array(external_exports.string().max(200)).max(100),
   models: external_exports.array(id).max(200),
-  parentInteractions: external_exports.boolean().default(false)
+  parentInteractions: external_exports.boolean().default(false),
+  permissionModes: external_exports.array(permissionMode).max(PERMISSION_MODES.length).default(["workspace-write"]).transform(normalizePermissionModes)
 }).strict();
 var actionSchema = external_exports.discriminatedUnion("type", [
   external_exports.object({ type: external_exports.literal("takeover"), sessionId: id }).strict(),
@@ -38806,7 +38813,8 @@ var startSchema = external_exports.object({
   workspaceId: id,
   preset: external_exports.string().max(200),
   selection: selectionSchema,
-  sessionId: id.optional()
+  sessionId: id.optional(),
+  permissionMode: permissionMode.optional()
 }).strict();
 var messageSchema = external_exports.object({
   requestId: id,

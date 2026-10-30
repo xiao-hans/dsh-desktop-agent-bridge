@@ -1,15 +1,27 @@
 import { z } from 'zod';
 
 export const PACKAGE_NAME = 'dsh-agent-collaboration';
-export const VERSION = '0.1.1';
+export const VERSION = '0.1.2';
 const id = z.string().min(1).max(200);
 const clientId = z.string().regex(/^[a-z][a-z0-9_-]{0,47}$/);
+// Permission modes a user may explicitly grant a client. Default stays the tightest preset.
+export const PERMISSION_MODES = ['workspace-write', 'danger-full-access'];
+const permissionMode = z.enum(PERMISSION_MODES);
+export function normalizePermissionModes(modes) {
+  const list = (modes ?? ['workspace-write']).slice().sort();
+  return list.length ? list : ['workspace-write'];
+}
+export function permissionModesChanged(before, after) {
+  return JSON.stringify(normalizePermissionModes(before)) !== JSON.stringify(normalizePermissionModes(after));
+}
 export const clientPolicySchema = z.object({
   id: clientId, label: z.string().min(1).max(80),
   workspaceIds: z.array(id).max(100),
   presets: z.array(z.string().max(200)).max(100),
   models: z.array(id).max(200),
   parentInteractions: z.boolean().default(false),
+  permissionModes: z.array(permissionMode).max(PERMISSION_MODES.length).default(['workspace-write'])
+    .transform(normalizePermissionModes),
 }).strict();
 export const actionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('takeover'), sessionId: id }).strict(),
@@ -30,6 +42,7 @@ export const startSchema = z.object({
   preset: z.string().max(200),
   selection: selectionSchema,
   sessionId: id.optional(),
+  permissionMode: permissionMode.optional(),
 }).strict();
 export const messageSchema = z.object({
   requestId: id, sessionId: id, text: z.string().min(1).max(50000),

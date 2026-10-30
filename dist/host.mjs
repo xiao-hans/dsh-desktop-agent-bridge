@@ -13,542 +13,6 @@ import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 
 // src/host-adapter.mjs
 import { randomUUID } from "node:crypto";
-function fail(message, code = "HOST_INCOMPATIBLE") {
-  throw Object.assign(new Error(message), { code });
-}
-function sessionSummary(item) {
-  const values = item.projections?.values ?? {};
-  const title = values.title?.title ?? values.title?.text ?? values.title ?? item.title;
-  return {
-    sessionId: item.sessionId,
-    title: typeof title === "string" ? title : item.sessionId,
-    cwd: values.workingDirectory ?? item.cwd,
-    preset: values.agentPreset ?? "",
-    running: item.running === true
-  };
-}
-function terminalStatus(reason, interrupted) {
-  if (reason?.kind === "completed") return interrupted ? "incomplete" : "succeeded";
-  if (reason?.kind === "max-tokens") return "incomplete";
-  if (reason?.kind === "aborted" && reason.reason?.kind === "user") return "cancelled";
-  return "failed";
-}
-function createHostAdapter(ctx) {
-  const peer = ctx.connection.createPeer({ principal: { kind: "owner" }, interactions: "none" });
-  let disposed = false;
-  let interactions;
-  let interactionScope = () => false;
-  let interactionRefresh = Promise.resolve();
-  const pendingQuestions = /* @__PURE__ */ new Map();
-  const offQuestions = ctx.on?.("user-questions/request", async (request, next) => {
-    const sessionId = request.agent?.session.id;
-    if (!sessionId) return next();
-    const pending = { requestId: randomUUID(), questions: request.questions };
-    const entries = pendingQuestions.get(sessionId) ?? /* @__PURE__ */ new Set();
-    entries.add(pending);
-    pendingQuestions.set(sessionId, entries);
-    try {
-      return await next();
-    } finally {
-      entries.delete(pending);
-      if (!entries.size) pendingQuestions.delete(sessionId);
-    }
-  }, { prepend: true, global: true });
-  const invoke = (namespace, method, args) => {
-    if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
-    return ctx.typertGateway.invoke({ namespace, method, args, peer });
-  };
-  async function first(namespace, method, args) {
-    if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
-    const abort = new AbortController();
-    let iterator;
-    try {
-      const stream = await ctx.typertGateway.stream({ namespace, method, args, peer, signal: abort.signal });
-      iterator = stream[Symbol.asyncIterator]();
-      const result = await iterator.next();
-      if (result.done) fail(`${namespace}.${method} returned no baseline.`);
-      return result.value;
-    } finally {
-      abort.abort();
-      await iterator?.return?.();
-    }
-  }
-  async function agentFor(sessionId) {
-    const found = await ctx.sessionController.resolveAgent(sessionId);
-    if ("error" in found) throw found.error;
-    return found.agent;
-  }
-  async function history(sessionId) {
-    const address = { kind: "session", sessionId };
-    const snapshot = await first("session", "follow", {
-      request: { address, maxMessages: 100, assistantStream: true }
-    });
-    if (snapshot.type !== "snapshot") fail("session.follow returned an incompatible snapshot.");
-    let events = snapshot.records.map((record2) => record2.event);
-    let hasMore = snapshot.hasMore;
-    while (hasMore) {
-      const beforeSeq = events[0]?.seq;
-      if (!Number.isSafeInteger(beforeSeq) || beforeSeq <= 0) fail("Session history pagination made no progress.");
-      const page = await invoke("session", "page", {
-        request: { address, throughSeq: snapshot.cursor, beforeSeq, maxMessages: 100 }
-      });
-      const older = page.records.map((record2) => record2.event);
-      if (!older.length || older.at(-1).seq >= beforeSeq) fail("Session history pagination returned overlapping events.");
-      events = [...older, ...events];
-      hasMore = page.hasMore;
-    }
-    return { ...snapshot, events };
-  }
-  function requireHumanPermissions() {
-    const spec = ctx.permissionPresets.resolve("workspace-write");
-    if (spec.sandbox !== "workspace-write" || spec.approval !== "ask") {
-      fail("The workspace-write permission preset must use workspace-write confinement and human approval.");
-    }
-  }
-  async function catalog() {
-    const [workspaceFrame, modelCatalog, presetCatalog, sessionCatalog] = await Promise.all([
-      first("workspace", "follow", {}),
-      invoke("session", "modelCatalog", {}),
-      invoke("agentPresets", "list", {}),
-      invoke("session", "list", { _request: {} })
-    ]);
-    if (workspaceFrame.type !== "baseline") fail("workspace.follow returned an incompatible baseline.");
-    return {
-      workspaces: workspaceFrame.value.items.map(({ workspaceId, path, title }) => ({ workspaceId, path, title })),
-      models: modelCatalog.groups.flatMap((group) => group.models.map((model) => ({
-        provider: group.id,
-        model: model.id,
-        label: `${group.name ?? group.id} / ${model.name ?? model.id}`,
-        reasoningEfforts: model.reasoning?.efforts.map((effort) => effort.id) ?? [],
-        default: group.id === modelCatalog.default?.provider && model.id === modelCatalog.default?.model,
-        ...model.reasoning?.defaultEffort === void 0 ? {} : { defaultReasoningEffort: model.reasoning.defaultEffort }
-      }))),
-      presets: presetCatalog.presets.filter((preset) => !preset.broken).map((preset) => ({
-        id: preset.id,
-        label: preset.name ?? preset.id,
-        default: preset.isDefault === true
-      })),
-      sessions: sessionCatalog.items.map(sessionSummary)
-    };
-  }
-  async function createWorkspace(path) {
-    const { workspace } = await invoke("workspace", "create", { request: { path } });
-    return { workspaceId: workspace.workspaceId, path: workspace.path, title: workspace.title };
-  }
-  async function create({ workspaceId, preset, selection, title }) {
-    requireHumanPermissions();
-    const available = await catalog();
-    if (!available.workspaces.some((workspace) => workspace.workspaceId === workspaceId)) {
-      fail("Choose an existing DSH workspace.", "INVALID_WORKSPACE");
-    }
-    const presetId = preset || available.presets.find((item) => item.default)?.id;
-    if (!presetId || !available.presets.some((item) => item.id === presetId)) {
-      fail("Choose an available DSH capability preset.", "INVALID_PRESET");
-    }
-    const sessionSelection = await validateSelection(selection, available.models);
-    const created = await invoke("session", "create", {
-      request: { workspaceId, agentPreset: presetId }
-    });
-    const agent = await agentFor(created.sessionId);
-    ctx.permissionPresets.set(agent.session, "workspace-write");
-    if (ctx.permissionPresets.current(agent.session) !== "workspace-write") {
-      fail("DSH did not retain the required permission preset.");
-    }
-    ctx.sessionController.agents.selectForNextRequest(agent, sessionSelection);
-    if (title) await invoke("session", "rename", { request: { sessionId: created.sessionId, title } });
-    await ctx.sessions.flush(agent.session);
-    return { sessionId: created.sessionId, preset: presetId, selection: sessionSelection };
-  }
-  async function validateSelection(selection, models) {
-    const selected = selection ?? models.find((model2) => model2.default);
-    const model = models.find((item) => item.provider === selected?.provider && item.model === selected?.model);
-    if (!model) fail("Choose an available DSH model.", "INVALID_MODEL");
-    if (selected.reasoningEffort !== void 0 && !model.reasoningEfforts.includes(selected.reasoningEffort)) {
-      fail("The selected model does not support this reasoning effort.", "INVALID_REASONING_EFFORT");
-    }
-    const resolved = await ctx.llm.resolveCallConfig({
-      provider: selected.provider,
-      model: selected.model,
-      ...selected.reasoningEffort === void 0 ? {} : { reasoningEffort: selected.reasoningEffort }
-    });
-    const normalized = {
-      provider: resolved.provider,
-      model: resolved.model,
-      ...resolved.reasoningEffort === void 0 ? {} : { reasoningEffort: resolved.reasoningEffort }
-    };
-    if (typeof ctx.sessionController.agents?.selectForNextRequest !== "function") {
-      fail("This DSH version lacks the session-only model selection method.");
-    }
-    return normalized;
-  }
-  async function selectModel(sessionId, selection) {
-    const normalized = await validateSelection(selection, (await catalog()).models);
-    const agent = await agentFor(sessionId);
-    if (agent.status === "running" || agent.inbox.nextTurn.length || agent.inbox.nextStep.length) {
-      fail("Choose the next model after the current turn and pending inputs end.", "SESSION_BUSY");
-    }
-    ctx.sessionController.agents.selectForNextRequest(agent, normalized);
-    await ctx.sessions.flush(agent.session);
-    return normalized;
-  }
-  async function inspect(sessionId) {
-    const snapshot = await history(sessionId);
-    const { events } = snapshot;
-    const agent = ctx.agents.get(sessionId);
-    const hasPending = (agent?.inbox.nextTurn.length ?? 0) + (agent?.inbox.nextStep.length ?? 0) > 0;
-    const running = agent?.status === "running" || hasPending;
-    const approvals = /* @__PURE__ */ new Map();
-    let lastStart;
-    let lastEnd;
-    let lastAssistant;
-    const text = [];
-    for (const event of events) {
-      if (event.type === "turn/start") lastStart = event;
-      if (event.type === "turn/end") lastEnd = event;
-      if (event.type === "approval/asked") approvals.set(event.data.id, event.data);
-      if (event.type === "approval/decided") approvals.delete(event.data.id);
-      if (event.type === "assistant/message") {
-        lastAssistant = event;
-        const content = event.data.message?.content ?? [];
-        const rendered = content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
-        if (rendered) text.push(rendered);
-      }
-    }
-    const values = snapshot.projections?.values ?? {};
-    const questions = [
-      ...pendingQuestions.get(sessionId) ?? [],
-      ...(values.userQuestions?.active ?? []).filter((question) => question.state === "open")
-    ];
-    let status = "idle";
-    if (approvals.size) status = "awaiting_approval";
-    else if (questions.length) status = "awaiting_input";
-    else if (running) status = "running";
-    else if (lastEnd && (!lastStart || lastEnd.seq > lastStart.seq)) {
-      status = terminalStatus(lastEnd.data.reason, lastAssistant?.data.interrupted === true);
-    }
-    return {
-      sessionId,
-      running,
-      status,
-      events,
-      lastSeq: snapshot.cursor,
-      assistantText: text.join("\n\n"),
-      assistantStream: snapshot.assistantStream,
-      pendingApprovals: [...approvals.values()],
-      pendingQuestions: questions,
-      selection: values.modelSelection?.next ?? values.modelSelection?.lastUsed,
-      preset: values.agentPreset ?? "",
-      cwd: values.workingDirectory ?? snapshot.header?.cwd,
-      endingReason: lastEnd?.data.reason,
-      title: typeof values.title === "string" ? values.title : sessionId
-    };
-  }
-  async function send(sessionId, { text, source, mode = "queue", messageId = randomUUID() }) {
-    if (typeof text !== "string" || !text.trim()) fail("A nonempty message is required.", "INVALID_MESSAGE");
-    if (!["queue", "steer"].includes(mode)) fail("Unsupported message delivery mode.", "INVALID_MESSAGE");
-    if (typeof source?.principal !== "string" || !source.principal) fail("An authenticated source principal is required.", "INVALID_PRINCIPAL");
-    const agent = await agentFor(sessionId);
-    requireHumanPermissions();
-    if (ctx.permissionPresets.current(agent.session) !== "workspace-write") {
-      fail("Select workspace-write with human approval in this DSH session before handing it to an external agent.", "UNSAFE_SESSION_PERMISSIONS");
-    }
-    const snapshot = await history(sessionId);
-    const accepted = snapshot.events.flatMap((event) => event.type === "agent/inbox/spliced" ? event.data.inserted : event.type === "user/message" ? [event.data] : []);
-    const existing = accepted.find((message2) => message2.id === messageId);
-    if (existing) {
-      if (existing.source?.principal !== source.principal || existing.content?.map((block) => block.text ?? "").join("") !== text) {
-        fail("This message identifier already belongs to a different request.", "IDEMPOTENCY_CONFLICT");
-      }
-      return messageId;
-    }
-    const message = Object.freeze({
-      id: messageId,
-      role: "user",
-      content: Object.freeze([Object.freeze({ type: "text", text })]),
-      source: Object.freeze({ kind: "dsh-collaboration", principal: source.principal, rpcId: messageId })
-    });
-    if (mode === "steer") agent.steer(message);
-    else agent.followup(message);
-    await ctx.sessions.flush(agent.session);
-    return messageId;
-  }
-  async function takeover(sessionId, principal) {
-    const agent = await agentFor(sessionId);
-    const removed = [];
-    for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) {
-      if (message.source.kind === "dsh-collaboration" && message.source.principal === principal && agent.inbox.remove(message.id)) removed.push(message.id);
-    }
-    await ctx.sessions.flush(agent.session);
-    return { removedMessageIds: removed };
-  }
-  async function cancel(sessionId) {
-    const agent = await agentFor(sessionId);
-    agent.cancel({ kind: "user" });
-    return { accepted: true };
-  }
-  async function adopt(sessionId) {
-    const agent = await agentFor(sessionId);
-    const [state, workspaceFrame] = await Promise.all([
-      inspect(sessionId),
-      first("workspace", "follow", {})
-    ]);
-    if (workspaceFrame.type !== "baseline") fail("workspace.follow returned an incompatible baseline.");
-    const workspace = workspaceFrame.value.items.find((item) => item.sessionIds.includes(sessionId));
-    if (!workspace) fail("This session is not attached to a DSH workspace.", "INVALID_WORKSPACE");
-    const selection = state.selection ?? ctx.sessionController.agents.selectionFor(agent).current;
-    return {
-      workspaceId: workspace.workspaceId,
-      workspace: workspace.path,
-      preset: state.preset,
-      selection: { ...selection },
-      title: state.title,
-      status: state.status
-    };
-  }
-  function setInteractionScope(predicate) {
-    if (typeof predicate !== "function") fail("An interaction scope predicate is required.", "INVALID_INTERACTION_SCOPE");
-    interactionScope = predicate;
-  }
-  function hasInteractionScope(sessionId) {
-    try {
-      return interactionScope(sessionId) === true;
-    } catch {
-      return false;
-    }
-  }
-  async function startInteractions() {
-    if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
-    if (interactions?.error) fail("The native interaction stream is unavailable.", "INTERACTIONS_UNAVAILABLE");
-    if (interactions) return interactions.ready;
-    if (typeof ctx.typertGateway.wireStream?.open !== "function" || typeof ctx.typertGateway.dispatchRpc !== "function") {
-      fail("This DSH version lacks the native interaction stream.");
-    }
-    const state = {
-      peer: ctx.connection.createPeer({ principal: { kind: "owner" }, interactions: "answer" }),
-      abort: new AbortController(),
-      pending: /* @__PURE__ */ new Map(),
-      byNative: /* @__PURE__ */ new Map(),
-      clientId: null,
-      iterator: null,
-      closing: false
-    };
-    interactions = state;
-    const submit = (eventId, outcome) => ctx.typertGateway.dispatchRpc("$events/result", {
-      args: { clientId: state.clientId, eventId, outcome }
-    }, state.abort.signal, state.peer);
-    state.submit = submit;
-    const receive = async (frame) => {
-      if (frame.type === "cancel") {
-        state.pending.delete(state.byNative.get(frame.eventId));
-        state.byNative.delete(frame.eventId);
-        return;
-      }
-      if (frame.type !== "waterfall") return;
-      const sessionId = ctx.agents.get(frame.agentId)?.session.id;
-      const kind = frame.event === "approval/request" ? "approval" : frame.event === "user-questions/request" ? "question" : null;
-      if (!kind || !sessionId || !hasInteractionScope(sessionId)) {
-        await submit(frame.eventId, { kind: "next" });
-        return;
-      }
-      if (typeof frame.eventId !== "string" || !frame.eventId || !frame.request || kind === "question" && !Array.isArray(frame.request.questions)) {
-        fail("The native interaction frame is incompatible.");
-      }
-      if (state.byNative.has(frame.eventId)) return;
-      if (state.pending.size >= 256) fail("Too many native interactions.", "INTERACTION_CAPACITY");
-      const request = frame.request;
-      const id2 = randomUUID();
-      state.byNative.set(frame.eventId, id2);
-      state.pending.set(id2, {
-        id: id2,
-        nativeId: frame.eventId,
-        kind,
-        sessionId,
-        createdAt: (/* @__PURE__ */ new Date()).toISOString(),
-        ...kind === "approval" ? {
-          toolName: request.toolName,
-          ...request.callId === void 0 ? {} : { callId: request.callId },
-          ...request.reason === void 0 ? {} : { reason: request.reason }
-        } : { questions: structuredClone(request.questions) }
-      });
-    };
-    state.ready = (async () => {
-      const deadline = setTimeout(() => state.abort.abort(new Error("Native interaction startup timed out")), 5e3);
-      deadline.unref();
-      try {
-        const stream = await ctx.typertGateway.wireStream.open(
-          "$events",
-          { args: {} },
-          void 0,
-          state.peer,
-          state.abort.signal
-        );
-        state.iterator = stream[Symbol.asyncIterator]();
-        const first2 = await state.iterator.next();
-        if (state.abort.signal.aborted || first2.done || first2.value?.type !== "ready" || typeof first2.value.clientId !== "string" || !first2.value.clientId) {
-          fail("The native interaction stream returned no ready frame.");
-        }
-        state.clientId = first2.value.clientId;
-        state.loop = (async () => {
-          try {
-            while (!state.abort.signal.aborted) {
-              const item = await state.iterator.next();
-              if (item.done) break;
-              await receive(item.value);
-            }
-            if (!state.abort.signal.aborted) fail("The native interaction stream ended.");
-          } catch (error62) {
-            if (!state.abort.signal.aborted) state.error = error62;
-          } finally {
-            state.pending.clear();
-            state.byNative.clear();
-            state.abort.abort();
-            try {
-              await state.peer.dispose();
-            } catch (error62) {
-              state.error = error62;
-            }
-          }
-        })();
-        return { ready: true };
-      } catch (error62) {
-        state.error = error62;
-        state.abort.abort();
-        await state.peer.dispose();
-        throw error62;
-      } finally {
-        clearTimeout(deadline);
-      }
-    })();
-    return state.ready;
-  }
-  async function ensureInteractions() {
-    await interactionRefresh;
-    return startInteractions();
-  }
-  async function closeInteractions(state) {
-    state.closing = true;
-    state.pending.clear();
-    state.byNative.clear();
-    state.abort.abort();
-    await state.peer.dispose();
-    await Promise.allSettled([state.ready, state.loop]);
-    await state.iterator?.return?.();
-  }
-  function refreshInteractionScope() {
-    const refresh = interactionRefresh.then(async () => {
-      if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
-      const state = interactions;
-      if (!state) return;
-      state.closing = true;
-      await state.ready.catch(() => {
-      });
-      try {
-        if (!state.abort.signal.aborted) {
-          for (const item of [...state.pending.values()]) {
-            if (hasInteractionScope(item.sessionId)) continue;
-            state.pending.delete(item.id);
-            state.byNative.delete(item.nativeId);
-            await state.submit(item.nativeId, { kind: "next" });
-          }
-        }
-      } finally {
-        await closeInteractions(state);
-        if (interactions === state) interactions = void 0;
-      }
-      if (!disposed) await startInteractions();
-    });
-    interactionRefresh = refresh.catch(() => {
-    });
-    return refresh;
-  }
-  async function listInteractions(sessionId) {
-    await ensureInteractions();
-    const state = interactions;
-    const selected = [...state.pending.values()].filter((item) => item.sessionId === sessionId && hasInteractionScope(sessionId));
-    if (!selected.length) return [];
-    const events = selected.some((item) => item.kind === "approval" && item.callId) ? (await history(sessionId)).events : [];
-    return selected.filter((item) => !state.closing && state.pending.get(item.id) === item && hasInteractionScope(item.sessionId)).map((item) => {
-      const toolCall = events.find((event) => event.type === "tool/call" && event.data.callId === item.callId)?.data;
-      const { nativeId, ...view } = item;
-      return structuredClone({ ...view, ...toolCall ? { toolCall } : {} });
-    });
-  }
-  function interactionResponse(sessionId, id2, response) {
-    if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
-    if (interactions?.error) fail("The native interaction stream is unavailable.", "INTERACTIONS_UNAVAILABLE");
-    const item = interactions?.closing ? void 0 : interactions?.pending.get(id2);
-    if (!item) fail("This interaction is no longer pending.", "INTERACTION_NOT_PENDING");
-    if (item.sessionId !== sessionId) fail("This interaction belongs to another session.", "INTERACTION_SESSION_DENIED");
-    if (!hasInteractionScope(sessionId)) fail("Interaction forwarding is disabled for this session.", "INTERACTION_SCOPE_DENIED");
-    const invalid = () => fail("The response does not match the native interaction.", "INTERACTION_INVALID_RESPONSE");
-    if (!response || response.kind !== item.kind) invalid();
-    let value;
-    if (item.kind === "approval") {
-      if (Object.keys(response).some((key) => !["kind", "decision"].includes(key)) || !["allowed-once", "rejected"].includes(response.decision)) invalid();
-      value = response.decision;
-    } else {
-      if (Object.keys(response).some((key) => !["kind", "answers"].includes(key)) || !Array.isArray(response.answers) || response.answers.length !== item.questions.length || new Set(response.answers.map((answer) => answer?.id)).size !== response.answers.length) invalid();
-      for (const question of item.questions) {
-        const answer = response.answers.find((candidate) => candidate?.id === question.id);
-        if (!answer || Object.keys(answer).some((key) => !["id", "selected", "custom"].includes(key)) || !Array.isArray(answer.selected) || new Set(answer.selected).size !== answer.selected.length || answer.selected.some((label) => typeof label !== "string" || !question.options?.some((option) => option.label === label)) || answer.custom !== void 0 && typeof answer.custom !== "string" || !question.multiSelect && answer.selected.length + (answer.custom?.trim() ? 1 : 0) > 1) invalid();
-      }
-      value = { answers: structuredClone(response.answers) };
-    }
-    return value;
-  }
-  function validateInteractionResponse(sessionId, id2, response) {
-    interactionResponse(sessionId, id2, response);
-  }
-  async function respondInteraction(sessionId, id2, response) {
-    await ensureInteractions();
-    const value = interactionResponse(sessionId, id2, response);
-    const state = interactions;
-    const item = state.pending.get(id2);
-    state.pending.delete(id2);
-    state.byNative.delete(item.nativeId);
-    const result = await state.submit(item.nativeId, { kind: "result", value });
-    if (result?.ok !== true) fail("The native interaction response could not be submitted.", "INTERACTION_SUBMISSION_FAILED");
-    return { status: "submitted" };
-  }
-  async function dispose() {
-    if (disposed) return;
-    disposed = true;
-    offQuestions?.();
-    pendingQuestions.clear();
-    await interactionRefresh;
-    if (interactions) await closeInteractions(interactions);
-    await peer.dispose();
-  }
-  function uiStatus() {
-    const modules = ctx.get("clientModules");
-    const entry = modules?.graph().entries.find((item) => item.id === "dsh-agent-collaboration");
-    return { published: !!entry, entry: entry ?? null };
-  }
-  return {
-    catalog,
-    createWorkspace,
-    create,
-    inspect,
-    send,
-    takeover,
-    cancel,
-    selectModel,
-    adopt,
-    setInteractionScope,
-    refreshInteractionScope,
-    ensureInteractions,
-    listInteractions,
-    validateInteractionResponse,
-    respondInteraction,
-    dispose,
-    uiStatus
-  };
-}
-
-// src/broker.mjs
-import { randomBytes, randomUUID as randomUUID2, createHash, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, writeFile, rename, realpath } from "node:fs/promises";
-import { join } from "node:path";
 
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -20269,16 +19733,26 @@ function date4(params) {
 
 // src/protocol.mjs
 var PACKAGE_NAME = "dsh-agent-collaboration";
-var VERSION = "0.1.1";
+var VERSION = "0.1.2";
 var id = external_exports.string().min(1).max(200);
 var clientId = external_exports.string().regex(/^[a-z][a-z0-9_-]{0,47}$/);
+var PERMISSION_MODES = ["workspace-write", "danger-full-access"];
+var permissionMode = external_exports.enum(PERMISSION_MODES);
+function normalizePermissionModes(modes) {
+  const list = (modes ?? ["workspace-write"]).slice().sort();
+  return list.length ? list : ["workspace-write"];
+}
+function permissionModesChanged(before, after) {
+  return JSON.stringify(normalizePermissionModes(before)) !== JSON.stringify(normalizePermissionModes(after));
+}
 var clientPolicySchema = external_exports.object({
   id: clientId,
   label: external_exports.string().min(1).max(80),
   workspaceIds: external_exports.array(id).max(100),
   presets: external_exports.array(external_exports.string().max(200)).max(100),
   models: external_exports.array(id).max(200),
-  parentInteractions: external_exports.boolean().default(false)
+  parentInteractions: external_exports.boolean().default(false),
+  permissionModes: external_exports.array(permissionMode).max(PERMISSION_MODES.length).default(["workspace-write"]).transform(normalizePermissionModes)
 }).strict();
 var actionSchema = external_exports.discriminatedUnion("type", [
   external_exports.object({ type: external_exports.literal("takeover"), sessionId: id }).strict(),
@@ -20300,7 +19774,8 @@ var startSchema = external_exports.object({
   workspaceId: id,
   preset: external_exports.string().max(200),
   selection: selectionSchema,
-  sessionId: id.optional()
+  sessionId: id.optional(),
+  permissionMode: permissionMode.optional()
 }).strict();
 var messageSchema = external_exports.object({
   requestId: id,
@@ -20370,10 +19845,571 @@ var hostManifest = {
   model: { services: [], events: [], objects: [] }
 };
 
+// src/host-adapter.mjs
+function fail(message, code = "HOST_INCOMPATIBLE") {
+  throw Object.assign(new Error(message), { code });
+}
+function sessionSummary(item) {
+  const values = item.projections?.values ?? {};
+  const title = values.title?.title ?? values.title?.text ?? values.title ?? item.title;
+  return {
+    sessionId: item.sessionId,
+    title: typeof title === "string" ? title : item.sessionId,
+    cwd: values.workingDirectory ?? item.cwd,
+    preset: values.agentPreset ?? "",
+    running: item.running === true
+  };
+}
+function terminalStatus(reason, interrupted) {
+  if (reason?.kind === "completed") return interrupted ? "incomplete" : "succeeded";
+  if (reason?.kind === "max-tokens") return "incomplete";
+  if (reason?.kind === "aborted" && reason.reason?.kind === "user") return "cancelled";
+  return "failed";
+}
+function createHostAdapter(ctx) {
+  const peer = ctx.connection.createPeer({ principal: { kind: "owner" }, interactions: "none" });
+  let disposed = false;
+  let interactions;
+  let interactionScope = () => false;
+  let interactionRefresh = Promise.resolve();
+  const pendingQuestions = /* @__PURE__ */ new Map();
+  const offQuestions = ctx.on?.("user-questions/request", async (request, next) => {
+    const sessionId = request.agent?.session.id;
+    if (!sessionId) return next();
+    const pending = { requestId: randomUUID(), questions: request.questions };
+    const entries = pendingQuestions.get(sessionId) ?? /* @__PURE__ */ new Set();
+    entries.add(pending);
+    pendingQuestions.set(sessionId, entries);
+    try {
+      return await next();
+    } finally {
+      entries.delete(pending);
+      if (!entries.size) pendingQuestions.delete(sessionId);
+    }
+  }, { prepend: true, global: true });
+  const invoke = (namespace, method, args) => {
+    if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
+    return ctx.typertGateway.invoke({ namespace, method, args, peer });
+  };
+  async function first(namespace, method, args) {
+    if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
+    const abort = new AbortController();
+    let iterator;
+    try {
+      const stream = await ctx.typertGateway.stream({ namespace, method, args, peer, signal: abort.signal });
+      iterator = stream[Symbol.asyncIterator]();
+      const result = await iterator.next();
+      if (result.done) fail(`${namespace}.${method} returned no baseline.`);
+      return result.value;
+    } finally {
+      abort.abort();
+      await iterator?.return?.();
+    }
+  }
+  async function agentFor(sessionId) {
+    const found = await ctx.sessionController.resolveAgent(sessionId);
+    if ("error" in found) throw found.error;
+    return found.agent;
+  }
+  async function history(sessionId) {
+    const address = { kind: "session", sessionId };
+    const snapshot = await first("session", "follow", {
+      request: { address, maxMessages: 100, assistantStream: true }
+    });
+    if (snapshot.type !== "snapshot") fail("session.follow returned an incompatible snapshot.");
+    let events = snapshot.records.map((record2) => record2.event);
+    let hasMore = snapshot.hasMore;
+    while (hasMore) {
+      const beforeSeq = events[0]?.seq;
+      if (!Number.isSafeInteger(beforeSeq) || beforeSeq <= 0) fail("Session history pagination made no progress.");
+      const page = await invoke("session", "page", {
+        request: { address, throughSeq: snapshot.cursor, beforeSeq, maxMessages: 100 }
+      });
+      const older = page.records.map((record2) => record2.event);
+      if (!older.length || older.at(-1).seq >= beforeSeq) fail("Session history pagination returned overlapping events.");
+      events = [...older, ...events];
+      hasMore = page.hasMore;
+    }
+    return { ...snapshot, events };
+  }
+  function requireHumanPermissions() {
+    const spec = ctx.permissionPresets.resolve("workspace-write");
+    if (spec.sandbox !== "workspace-write" || spec.approval !== "ask") {
+      fail("The workspace-write permission preset must use workspace-write confinement and human approval.");
+    }
+  }
+  let permissionScope = () => normalizePermissionModes(void 0);
+  function authorizedModes(principal) {
+    return normalizePermissionModes(principal ? permissionScope(principal) : void 0);
+  }
+  function requirePresetSafety(mode) {
+    if (mode !== "workspace-write") return;
+    requireHumanPermissions();
+  }
+  async function catalog() {
+    const [workspaceFrame, modelCatalog, presetCatalog, sessionCatalog] = await Promise.all([
+      first("workspace", "follow", {}),
+      invoke("session", "modelCatalog", {}),
+      invoke("agentPresets", "list", {}),
+      invoke("session", "list", { _request: {} })
+    ]);
+    if (workspaceFrame.type !== "baseline") fail("workspace.follow returned an incompatible baseline.");
+    return {
+      workspaces: workspaceFrame.value.items.map(({ workspaceId, path, title }) => ({ workspaceId, path, title })),
+      models: modelCatalog.groups.flatMap((group) => group.models.map((model) => ({
+        provider: group.id,
+        model: model.id,
+        label: `${group.name ?? group.id} / ${model.name ?? model.id}`,
+        reasoningEfforts: model.reasoning?.efforts.map((effort) => effort.id) ?? [],
+        default: group.id === modelCatalog.default?.provider && model.id === modelCatalog.default?.model,
+        ...model.reasoning?.defaultEffort === void 0 ? {} : { defaultReasoningEffort: model.reasoning.defaultEffort }
+      }))),
+      presets: presetCatalog.presets.filter((preset) => !preset.broken).map((preset) => ({
+        id: preset.id,
+        label: preset.name ?? preset.id,
+        default: preset.isDefault === true
+      })),
+      sessions: sessionCatalog.items.map(sessionSummary)
+    };
+  }
+  async function createWorkspace(path) {
+    const { workspace } = await invoke("workspace", "create", { request: { path } });
+    return { workspaceId: workspace.workspaceId, path: workspace.path, title: workspace.title };
+  }
+  async function create({ workspaceId, preset, selection, title, principal, permissionMode: permissionMode2 }) {
+    const modes = authorizedModes(principal);
+    const requested = permissionMode2 ?? (modes.includes("workspace-write") ? "workspace-write" : modes[0]);
+    if (!modes.includes(requested)) {
+      fail("Select a permission mode the user has explicitly authorized for this client.", "UNSAFE_SESSION_PERMISSIONS");
+    }
+    requirePresetSafety(requested);
+    const available = await catalog();
+    if (!available.workspaces.some((workspace) => workspace.workspaceId === workspaceId)) {
+      fail("Choose an existing DSH workspace.", "INVALID_WORKSPACE");
+    }
+    const presetId = preset || available.presets.find((item) => item.default)?.id;
+    if (!presetId || !available.presets.some((item) => item.id === presetId)) {
+      fail("Choose an available DSH capability preset.", "INVALID_PRESET");
+    }
+    const sessionSelection = await validateSelection(selection, available.models);
+    const created = await invoke("session", "create", {
+      request: { workspaceId, agentPreset: presetId }
+    });
+    const agent = await agentFor(created.sessionId);
+    ctx.permissionPresets.set(agent.session, requested);
+    if (ctx.permissionPresets.current(agent.session) !== requested) {
+      fail("DSH did not retain the required permission preset.");
+    }
+    ctx.sessionController.agents.selectForNextRequest(agent, sessionSelection);
+    if (title) await invoke("session", "rename", { request: { sessionId: created.sessionId, title } });
+    await ctx.sessions.flush(agent.session);
+    return { sessionId: created.sessionId, preset: presetId, selection: sessionSelection };
+  }
+  async function validateSelection(selection, models) {
+    const selected = selection ?? models.find((model2) => model2.default);
+    const model = models.find((item) => item.provider === selected?.provider && item.model === selected?.model);
+    if (!model) fail("Choose an available DSH model.", "INVALID_MODEL");
+    if (selected.reasoningEffort !== void 0 && !model.reasoningEfforts.includes(selected.reasoningEffort)) {
+      fail("The selected model does not support this reasoning effort.", "INVALID_REASONING_EFFORT");
+    }
+    const resolved = await ctx.llm.resolveCallConfig({
+      provider: selected.provider,
+      model: selected.model,
+      ...selected.reasoningEffort === void 0 ? {} : { reasoningEffort: selected.reasoningEffort }
+    });
+    const normalized = {
+      provider: resolved.provider,
+      model: resolved.model,
+      ...resolved.reasoningEffort === void 0 ? {} : { reasoningEffort: resolved.reasoningEffort }
+    };
+    if (typeof ctx.sessionController.agents?.selectForNextRequest !== "function") {
+      fail("This DSH version lacks the session-only model selection method.");
+    }
+    return normalized;
+  }
+  async function selectModel(sessionId, selection) {
+    const normalized = await validateSelection(selection, (await catalog()).models);
+    const agent = await agentFor(sessionId);
+    if (agent.status === "running" || agent.inbox.nextTurn.length || agent.inbox.nextStep.length) {
+      fail("Choose the next model after the current turn and pending inputs end.", "SESSION_BUSY");
+    }
+    ctx.sessionController.agents.selectForNextRequest(agent, normalized);
+    await ctx.sessions.flush(agent.session);
+    return normalized;
+  }
+  async function inspect(sessionId) {
+    const snapshot = await history(sessionId);
+    const { events } = snapshot;
+    const agent = ctx.agents.get(sessionId);
+    const hasPending = (agent?.inbox.nextTurn.length ?? 0) + (agent?.inbox.nextStep.length ?? 0) > 0;
+    const running = agent?.status === "running" || hasPending;
+    const approvals = /* @__PURE__ */ new Map();
+    let lastStart;
+    let lastEnd;
+    let lastAssistant;
+    const text = [];
+    for (const event of events) {
+      if (event.type === "turn/start") lastStart = event;
+      if (event.type === "turn/end") lastEnd = event;
+      if (event.type === "approval/asked") approvals.set(event.data.id, event.data);
+      if (event.type === "approval/decided") approvals.delete(event.data.id);
+      if (event.type === "assistant/message") {
+        lastAssistant = event;
+        const content = event.data.message?.content ?? [];
+        const rendered = content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+        if (rendered) text.push(rendered);
+      }
+    }
+    const values = snapshot.projections?.values ?? {};
+    const questions = [
+      ...pendingQuestions.get(sessionId) ?? [],
+      ...(values.userQuestions?.active ?? []).filter((question) => question.state === "open")
+    ];
+    let status = "idle";
+    if (approvals.size) status = "awaiting_approval";
+    else if (questions.length) status = "awaiting_input";
+    else if (running) status = "running";
+    else if (lastEnd && (!lastStart || lastEnd.seq > lastStart.seq)) {
+      status = terminalStatus(lastEnd.data.reason, lastAssistant?.data.interrupted === true);
+    }
+    return {
+      sessionId,
+      running,
+      status,
+      events,
+      lastSeq: snapshot.cursor,
+      assistantText: text.join("\n\n"),
+      assistantStream: snapshot.assistantStream,
+      pendingApprovals: [...approvals.values()],
+      pendingQuestions: questions,
+      selection: values.modelSelection?.next ?? values.modelSelection?.lastUsed,
+      preset: values.agentPreset ?? "",
+      cwd: values.workingDirectory ?? snapshot.header?.cwd,
+      endingReason: lastEnd?.data.reason,
+      title: typeof values.title === "string" ? values.title : sessionId
+    };
+  }
+  async function send(sessionId, { text, source, mode = "queue", messageId = randomUUID() }) {
+    if (typeof text !== "string" || !text.trim()) fail("A nonempty message is required.", "INVALID_MESSAGE");
+    if (!["queue", "steer"].includes(mode)) fail("Unsupported message delivery mode.", "INVALID_MESSAGE");
+    if (typeof source?.principal !== "string" || !source.principal) fail("An authenticated source principal is required.", "INVALID_PRINCIPAL");
+    const agent = await agentFor(sessionId);
+    const modes = authorizedModes(source.principal);
+    const current = ctx.permissionPresets.current(agent.session);
+    if (!modes.includes(current)) {
+      fail("This DSH session runs in a permission mode the user has not authorized for this client. Select an allowed preset (default: workspace-write with human approval) before handing it to an external agent.", "UNSAFE_SESSION_PERMISSIONS");
+    }
+    requirePresetSafety(current);
+    const snapshot = await history(sessionId);
+    const accepted = snapshot.events.flatMap((event) => event.type === "agent/inbox/spliced" ? event.data.inserted : event.type === "user/message" ? [event.data] : []);
+    const existing = accepted.find((message2) => message2.id === messageId);
+    if (existing) {
+      if (existing.source?.principal !== source.principal || existing.content?.map((block) => block.text ?? "").join("") !== text) {
+        fail("This message identifier already belongs to a different request.", "IDEMPOTENCY_CONFLICT");
+      }
+      return messageId;
+    }
+    const message = Object.freeze({
+      id: messageId,
+      role: "user",
+      content: Object.freeze([Object.freeze({ type: "text", text })]),
+      source: Object.freeze({ kind: "dsh-collaboration", principal: source.principal, rpcId: messageId })
+    });
+    if (mode === "steer") agent.steer(message);
+    else agent.followup(message);
+    await ctx.sessions.flush(agent.session);
+    return messageId;
+  }
+  async function takeover(sessionId, principal) {
+    const agent = await agentFor(sessionId);
+    const removed = [];
+    for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) {
+      if (message.source.kind === "dsh-collaboration" && message.source.principal === principal && agent.inbox.remove(message.id)) removed.push(message.id);
+    }
+    await ctx.sessions.flush(agent.session);
+    return { removedMessageIds: removed };
+  }
+  async function cancel(sessionId) {
+    const agent = await agentFor(sessionId);
+    agent.cancel({ kind: "user" });
+    return { accepted: true };
+  }
+  async function adopt(sessionId) {
+    const agent = await agentFor(sessionId);
+    const [state, workspaceFrame] = await Promise.all([
+      inspect(sessionId),
+      first("workspace", "follow", {})
+    ]);
+    if (workspaceFrame.type !== "baseline") fail("workspace.follow returned an incompatible baseline.");
+    const workspace = workspaceFrame.value.items.find((item) => item.sessionIds.includes(sessionId));
+    if (!workspace) fail("This session is not attached to a DSH workspace.", "INVALID_WORKSPACE");
+    const selection = state.selection ?? ctx.sessionController.agents.selectionFor(agent).current;
+    return {
+      workspaceId: workspace.workspaceId,
+      workspace: workspace.path,
+      preset: state.preset,
+      selection: { ...selection },
+      title: state.title,
+      status: state.status
+    };
+  }
+  function setInteractionScope(predicate) {
+    if (typeof predicate !== "function") fail("An interaction scope predicate is required.", "INVALID_INTERACTION_SCOPE");
+    interactionScope = predicate;
+  }
+  function setPermissionScope(provider) {
+    if (typeof provider !== "function") fail("A permission scope provider is required.", "INVALID_PERMISSION_SCOPE");
+    permissionScope = provider;
+  }
+  function hasInteractionScope(sessionId) {
+    try {
+      return interactionScope(sessionId) === true;
+    } catch {
+      return false;
+    }
+  }
+  async function startInteractions() {
+    if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
+    if (interactions?.error) fail("The native interaction stream is unavailable.", "INTERACTIONS_UNAVAILABLE");
+    if (interactions) return interactions.ready;
+    if (typeof ctx.typertGateway.wireStream?.open !== "function" || typeof ctx.typertGateway.dispatchRpc !== "function") {
+      fail("This DSH version lacks the native interaction stream.");
+    }
+    const state = {
+      peer: ctx.connection.createPeer({ principal: { kind: "owner" }, interactions: "answer" }),
+      abort: new AbortController(),
+      pending: /* @__PURE__ */ new Map(),
+      byNative: /* @__PURE__ */ new Map(),
+      clientId: null,
+      iterator: null,
+      closing: false
+    };
+    interactions = state;
+    const submit = (eventId, outcome) => ctx.typertGateway.dispatchRpc("$events/result", {
+      args: { clientId: state.clientId, eventId, outcome }
+    }, state.abort.signal, state.peer);
+    state.submit = submit;
+    const receive = async (frame) => {
+      if (frame.type === "cancel") {
+        state.pending.delete(state.byNative.get(frame.eventId));
+        state.byNative.delete(frame.eventId);
+        return;
+      }
+      if (frame.type !== "waterfall") return;
+      const sessionId = ctx.agents.get(frame.agentId)?.session.id;
+      const kind = frame.event === "approval/request" ? "approval" : frame.event === "user-questions/request" ? "question" : null;
+      if (!kind || !sessionId || !hasInteractionScope(sessionId)) {
+        await submit(frame.eventId, { kind: "next" });
+        return;
+      }
+      if (typeof frame.eventId !== "string" || !frame.eventId || !frame.request || kind === "question" && !Array.isArray(frame.request.questions)) {
+        fail("The native interaction frame is incompatible.");
+      }
+      if (state.byNative.has(frame.eventId)) return;
+      if (state.pending.size >= 256) fail("Too many native interactions.", "INTERACTION_CAPACITY");
+      const request = frame.request;
+      const id2 = randomUUID();
+      state.byNative.set(frame.eventId, id2);
+      state.pending.set(id2, {
+        id: id2,
+        nativeId: frame.eventId,
+        kind,
+        sessionId,
+        createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+        ...kind === "approval" ? {
+          toolName: request.toolName,
+          ...request.callId === void 0 ? {} : { callId: request.callId },
+          ...request.reason === void 0 ? {} : { reason: request.reason }
+        } : { questions: structuredClone(request.questions) }
+      });
+    };
+    state.ready = (async () => {
+      const deadline = setTimeout(() => state.abort.abort(new Error("Native interaction startup timed out")), 5e3);
+      deadline.unref();
+      try {
+        const stream = await ctx.typertGateway.wireStream.open(
+          "$events",
+          { args: {} },
+          void 0,
+          state.peer,
+          state.abort.signal
+        );
+        state.iterator = stream[Symbol.asyncIterator]();
+        const first2 = await state.iterator.next();
+        if (state.abort.signal.aborted || first2.done || first2.value?.type !== "ready" || typeof first2.value.clientId !== "string" || !first2.value.clientId) {
+          fail("The native interaction stream returned no ready frame.");
+        }
+        state.clientId = first2.value.clientId;
+        state.loop = (async () => {
+          try {
+            while (!state.abort.signal.aborted) {
+              const item = await state.iterator.next();
+              if (item.done) break;
+              await receive(item.value);
+            }
+            if (!state.abort.signal.aborted) fail("The native interaction stream ended.");
+          } catch (error62) {
+            if (!state.abort.signal.aborted) state.error = error62;
+          } finally {
+            state.pending.clear();
+            state.byNative.clear();
+            state.abort.abort();
+            try {
+              await state.peer.dispose();
+            } catch (error62) {
+              state.error = error62;
+            }
+          }
+        })();
+        return { ready: true };
+      } catch (error62) {
+        state.error = error62;
+        state.abort.abort();
+        await state.peer.dispose();
+        throw error62;
+      } finally {
+        clearTimeout(deadline);
+      }
+    })();
+    return state.ready;
+  }
+  async function ensureInteractions() {
+    await interactionRefresh;
+    return startInteractions();
+  }
+  async function closeInteractions(state) {
+    state.closing = true;
+    state.pending.clear();
+    state.byNative.clear();
+    state.abort.abort();
+    await state.peer.dispose();
+    await Promise.allSettled([state.ready, state.loop]);
+    await state.iterator?.return?.();
+  }
+  function refreshInteractionScope() {
+    const refresh = interactionRefresh.then(async () => {
+      if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
+      const state = interactions;
+      if (!state) return;
+      state.closing = true;
+      await state.ready.catch(() => {
+      });
+      try {
+        if (!state.abort.signal.aborted) {
+          for (const item of [...state.pending.values()]) {
+            if (hasInteractionScope(item.sessionId)) continue;
+            state.pending.delete(item.id);
+            state.byNative.delete(item.nativeId);
+            await state.submit(item.nativeId, { kind: "next" });
+          }
+        }
+      } finally {
+        await closeInteractions(state);
+        if (interactions === state) interactions = void 0;
+      }
+      if (!disposed) await startInteractions();
+    });
+    interactionRefresh = refresh.catch(() => {
+    });
+    return refresh;
+  }
+  async function listInteractions(sessionId) {
+    await ensureInteractions();
+    const state = interactions;
+    const selected = [...state.pending.values()].filter((item) => item.sessionId === sessionId && hasInteractionScope(sessionId));
+    if (!selected.length) return [];
+    const events = selected.some((item) => item.kind === "approval" && item.callId) ? (await history(sessionId)).events : [];
+    return selected.filter((item) => !state.closing && state.pending.get(item.id) === item && hasInteractionScope(item.sessionId)).map((item) => {
+      const toolCall = events.find((event) => event.type === "tool/call" && event.data.callId === item.callId)?.data;
+      const { nativeId, ...view } = item;
+      return structuredClone({ ...view, ...toolCall ? { toolCall } : {} });
+    });
+  }
+  function interactionResponse(sessionId, id2, response) {
+    if (disposed) fail("DSH collaboration adapter is disposed.", "HOST_DISPOSED");
+    if (interactions?.error) fail("The native interaction stream is unavailable.", "INTERACTIONS_UNAVAILABLE");
+    const item = interactions?.closing ? void 0 : interactions?.pending.get(id2);
+    if (!item) fail("This interaction is no longer pending.", "INTERACTION_NOT_PENDING");
+    if (item.sessionId !== sessionId) fail("This interaction belongs to another session.", "INTERACTION_SESSION_DENIED");
+    if (!hasInteractionScope(sessionId)) fail("Interaction forwarding is disabled for this session.", "INTERACTION_SCOPE_DENIED");
+    const invalid = () => fail("The response does not match the native interaction.", "INTERACTION_INVALID_RESPONSE");
+    if (!response || response.kind !== item.kind) invalid();
+    let value;
+    if (item.kind === "approval") {
+      if (Object.keys(response).some((key) => !["kind", "decision"].includes(key)) || !["allowed-once", "rejected"].includes(response.decision)) invalid();
+      value = response.decision;
+    } else {
+      if (Object.keys(response).some((key) => !["kind", "answers"].includes(key)) || !Array.isArray(response.answers) || response.answers.length !== item.questions.length || new Set(response.answers.map((answer) => answer?.id)).size !== response.answers.length) invalid();
+      for (const question of item.questions) {
+        const answer = response.answers.find((candidate) => candidate?.id === question.id);
+        if (!answer || Object.keys(answer).some((key) => !["id", "selected", "custom"].includes(key)) || !Array.isArray(answer.selected) || new Set(answer.selected).size !== answer.selected.length || answer.selected.some((label) => typeof label !== "string" || !question.options?.some((option) => option.label === label)) || answer.custom !== void 0 && typeof answer.custom !== "string" || !question.multiSelect && answer.selected.length + (answer.custom?.trim() ? 1 : 0) > 1) invalid();
+      }
+      value = { answers: structuredClone(response.answers) };
+    }
+    return value;
+  }
+  function validateInteractionResponse(sessionId, id2, response) {
+    interactionResponse(sessionId, id2, response);
+  }
+  async function respondInteraction(sessionId, id2, response) {
+    await ensureInteractions();
+    const value = interactionResponse(sessionId, id2, response);
+    const state = interactions;
+    const item = state.pending.get(id2);
+    state.pending.delete(id2);
+    state.byNative.delete(item.nativeId);
+    const result = await state.submit(item.nativeId, { kind: "result", value });
+    if (result?.ok !== true) fail("The native interaction response could not be submitted.", "INTERACTION_SUBMISSION_FAILED");
+    return { status: "submitted" };
+  }
+  async function dispose() {
+    if (disposed) return;
+    disposed = true;
+    offQuestions?.();
+    pendingQuestions.clear();
+    await interactionRefresh;
+    if (interactions) await closeInteractions(interactions);
+    await peer.dispose();
+  }
+  function uiStatus() {
+    const modules = ctx.get("clientModules");
+    const entry = modules?.graph().entries.find((item) => item.id === "dsh-agent-collaboration");
+    return { published: !!entry, entry: entry ?? null };
+  }
+  return {
+    catalog,
+    createWorkspace,
+    create,
+    inspect,
+    send,
+    takeover,
+    cancel,
+    selectModel,
+    adopt,
+    setInteractionScope,
+    setPermissionScope,
+    refreshInteractionScope,
+    ensureInteractions,
+    listInteractions,
+    validateInteractionResponse,
+    respondInteraction,
+    dispose,
+    uiStatus
+  };
+}
+
 // src/broker.mjs
+import { randomBytes, randomUUID as randomUUID2, createHash, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, writeFile, rename, realpath } from "node:fs/promises";
+import { join } from "node:path";
 var finished = /* @__PURE__ */ new Set(["completed", "failed", "cancelled", "blocked"]);
 function fail2(code, message) {
   throw Object.assign(new Error(message), { code });
+}
+function clientPermissionSummary(client) {
+  const modes = normalizePermissionModes(client?.permissionModes);
+  const approvals = modes.includes("workspace-write") ? "workspace-write: approvals human only" : "workspace-write not authorized";
+  return `${approvals}; modes: ${modes.join(", ")}`;
 }
 var digest = (value) => createHash("sha256").update(value).digest("hex");
 var fingerprint = (value) => digest(JSON.stringify(value));
@@ -20414,6 +20450,10 @@ var Broker = class {
     }
     this.state.interactionReplies ??= [];
     if (!Array.isArray(this.state.interactionReplies)) fail2("STATE_INVALID", "\u5BA1\u6279\u56DE\u590D\u8BB0\u5F55\u683C\u5F0F\u65E0\u6548\u3002");
+    for (const client of this.state.clients) {
+      client.permissionModes ??= ["workspace-write"];
+    }
+    this.adapter.setPermissionScope?.((principal) => normalizePermissionModes(this.state.clients.find((c) => c.id === principal)?.permissionModes));
     this.adapter.setInteractionScope?.((sessionId) => {
       const session = this.state.sessions.find((item) => item.sessionId === sessionId);
       const client = this.state.clients.find((item) => item.id === session?.principal);
@@ -20470,7 +20510,7 @@ var Broker = class {
       workspaces: all.workspaces.filter((w) => client.workspaceIds.includes(w.workspaceId)),
       presets: all.presets.filter((p) => client.presets.includes(p.id)),
       models: all.models.filter((m) => client.models.includes(`${m.provider}/${m.model}`)),
-      permission: "workspace-write; approvals: human only",
+      permission: clientPermissionSummary(client),
       parentInteractions: client.parentInteractions === true
     };
   }
@@ -20483,6 +20523,9 @@ var Broker = class {
         return this.result(existing);
       }
       const catalog = await this.catalog(principal);
+      const clientModes = normalizePermissionModes(this.client(principal).permissionModes);
+      const effectiveMode = input2.permissionMode ?? (clientModes.includes("workspace-write") ? "workspace-write" : clientModes[0]);
+      if (!clientModes.includes(effectiveMode)) fail2("PERMISSION_MODE_DENIED", "\u7528\u6237\u672A\u5411\u8BE5\u5BA2\u6237\u7AEF\u6388\u6743\u6B64\u4F1A\u8BDD\u6743\u9650\u6A21\u5F0F\u3002");
       const workspace = catalog.workspaces.find((w) => w.workspaceId === input2.workspaceId);
       if (!workspace) fail2("WORKSPACE_DENIED", "\u8BE5\u5DE5\u4F5C\u533A\u672A\u6388\u6743\u3002");
       if (!catalog.presets.some((p) => p.id === input2.preset)) fail2("PRESET_DENIED", "\u8BE5\u80FD\u529B\u5305\u672A\u6388\u6743\u3002");
@@ -20530,7 +20573,9 @@ var Broker = class {
             workspaceId: input2.workspaceId,
             preset: input2.preset,
             selection: input2.selection,
-            title: `[${this.client(principal).label}] ${run.title}`
+            title: `[${this.client(principal).label}] ${run.title}`,
+            principal,
+            permissionMode: effectiveMode
           });
           run.sessionId = created.sessionId;
           session = {
@@ -20541,6 +20586,7 @@ var Broker = class {
             workspaceId: input2.workspaceId,
             preset: input2.preset,
             selection: input2.selection,
+            permissionMode: effectiveMode,
             control: "agent",
             status: "queued"
           };
@@ -20833,7 +20879,7 @@ ${input2.text}`,
       sessions: this.state.sessions,
       runs: this.state.runs.map(({ task, fingerprint: fingerprint2, ...r }) => r),
       catalog: await this.adapter.catalog(),
-      policy: { clients: this.state.clients.map(({ id: id2, label, workspaceIds, presets, models, parentInteractions }) => clientPolicySchema.parse({ id: id2, label, workspaceIds, presets, models, parentInteractions })) }
+      policy: { clients: this.state.clients.map(({ id: id2, label, workspaceIds, presets, models, parentInteractions, permissionModes }) => clientPolicySchema.parse({ id: id2, label, workspaceIds, presets, models, parentInteractions, permissionModes })) }
     };
   }
   async action(raw) {
@@ -20851,7 +20897,8 @@ ${input2.text}`,
           connectionFile,
           workspaceIds: [],
           presets: [],
-          models: []
+          models: [],
+          permissionModes: ["workspace-write"]
         });
         await this.save();
         return { connectionFile };
@@ -20878,8 +20925,11 @@ ${input2.text}`,
             workspaceIds: client.workspaceIds,
             presets: client.presets,
             models: client.models,
-            parentInteractions: client.parentInteractions
-          })) !== JSON.stringify(policy)) client.interactionEpoch = (client.interactionEpoch ?? 0) + 1;
+            parentInteractions: client.parentInteractions,
+            permissionModes: client.permissionModes
+          })) !== JSON.stringify(policy) || permissionModesChanged(client.permissionModes, policy.permissionModes)) {
+            client.interactionEpoch = (client.interactionEpoch ?? 0) + 1;
+          }
           Object.assign(client, policy);
         }
         await this.save();
@@ -20892,7 +20942,13 @@ ${input2.text}`,
         if (!client.workspaceIds.includes(info.workspaceId) || !client.presets.includes(info.preset) || !client.models.includes(`${info.selection.provider}/${info.selection.model}`)) {
           fail2("RESOURCE_DENIED", "\u8BF7\u5148\u6388\u6743\u8BE5\u4F1A\u8BDD\u73B0\u6709\u7684\u5DE5\u4F5C\u533A\u3001\u80FD\u529B\u5305\u548C\u6A21\u578B\u3002");
         }
-        this.state.sessions.push({ ...info, sessionId: request.sessionId, principal: client.id, control: "agent" });
+        this.state.sessions.push({
+          ...info,
+          sessionId: request.sessionId,
+          principal: client.id,
+          permissionMode: info.permissionMode ?? "workspace-write",
+          control: "agent"
+        });
         await this.save();
         return { adopted: true };
       }
