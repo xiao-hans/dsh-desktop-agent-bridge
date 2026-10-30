@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 
 const bundle = await build({
-  entryPoints: [new URL('../src/client.jsx', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')],
+  entryPoints: [fileURLToPath(new URL('../src/client.jsx', import.meta.url))],
   bundle: true, write: false, format: 'esm', platform: 'node', jsx: 'automatic',
   loader: { '.css': 'text' },
   plugins: [{

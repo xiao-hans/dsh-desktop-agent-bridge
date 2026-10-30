@@ -43,7 +43,9 @@ assert(process.env.npm_execpath, 'Run this check with npm run check:release');
 const packed = spawnSync(process.execPath,
   [process.env.npm_execpath, 'pack', '--dry-run', '--json', '--ignore-scripts'], { encoding: 'utf8' });
 assert.equal(packed.status, 0, packed.stderr);
-const [archive] = JSON.parse(packed.stdout);
+// npm <11 emits a JSON array; npm >=11 (some builds) emits an object keyed by package name.
+const packedData = JSON.parse(packed.stdout);
+const [archive] = Array.isArray(packedData) ? packedData : Object.values(packedData);
 const names = archive.files.map(file => file.path);
 const required = ['package.json', 'LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md',
   'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md',
