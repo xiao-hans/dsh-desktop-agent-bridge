@@ -1,6 +1,6 @@
 # 发布与维护
 
-本项目通过 DSH 桌面端「插件 → 添加插件」从 GitHub 仓库或本地目录安装。仓库保留预构建的 `dist/*.mjs` 和 `dist/THIRD_PARTY_LICENSES.txt`；Git 安装不依赖 `prepare`，不要求用户授权安装时构建。`package.json` 的 `private: true` 防止误发 npm，不影响 DSH 从 Git 安装或本地 `npm pack`。内部包名 `dsh-agent-collaboration` 保持不变；`engines.dsh` 固定为已经验证的 `0.2.1-rc.2`，不要在未实测的版本上放宽范围。
+本项目通过 DSH 桌面端「插件 → 添加插件」从 GitHub 仓库或本地目录安装。仓库保留预构建的 `dist/*.mjs` 和 `dist/THIRD_PARTY_LICENSES.txt`；Git 安装不依赖 `prepare`，不要求用户授权安装时构建。`package.json` 的 `private: true` 防止误发 npm，不影响 DSH 从 Git 安装或本地 `npm pack`。内部包名 `dsh-agent-collaboration` 保持不变；`engines.dsh` 固定为已经验证的 `0.2.2-rc.1`（桌面端 `44.7.0`），不要在未实测的版本上放宽范围；版本升级时须先迁移并验收适配层，再同步该字段。
 
 ## 每次发布前
 

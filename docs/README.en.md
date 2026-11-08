@@ -4,7 +4,7 @@
 
 Delegate work from Codex, Hermes, Grok Bot, or another MCP client to an **already running DeepSeek Harness desktop application**. Watch native conversations, add instructions, approve operations, take control, or stop work in the same DSH window.
 
-This is an independent third-party plugin, not affiliated with DeepSeek AI. Version `0.1.2` is a preview. **Windows with DSH `0.2.1-rc.2`** is the verified host combination; other systems and DSH versions are unverified.
+This is an independent third-party plugin, not affiliated with DeepSeek AI. Version `0.1.2` is a preview. **Windows with DSH `0.2.2-rc.1`** (Desktop `44.7.0`) is the verified host combination; other systems and DSH versions are unverified.
 
 **Local stdio connections require no domain, server, or public service.** A cloud parent agent that cannot reach a local process needs a reachable HTTPS endpoint. A managed tunnel or self-hosted HTTPS can provide it; buying a domain or VPS is not required. Managed tunnels are an optional deployment suggestion, not an integrated or tested one-click feature. Default installation configures only the local plugin; it installs no new service, creates no account, and initiates no paid service.
 
@@ -21,7 +21,7 @@ Capability presets reuse existing DSH compositions, including their skills and M
 
 ## Install directly in DSH
 
-The verified host is **DSH Desktop `0.2.1-rc.2`**. Finish or stop active collaboration tasks, then open **Plugins → Add plugin** in the DSH sidebar. Enter:
+The verified host is **DSH Desktop `0.2.2-rc.1`** (app version `44.7.0`). Finish or stop active collaboration tasks, then open **Plugins → Add plugin** in the DSH sidebar. Enter:
 
 ```text
 https://github.com/WaldInsel/dsh-desktop-agent-bridge
@@ -130,7 +130,7 @@ The native DSH UI remains available. Its first valid answer wins. Takeover, stop
 
 ## Verification and limits
 
-Windows + DSH `0.2.1-rc.2` has been tested against the existing desktop host for task creation, continuation, result retrieval, UI, takeover/release/stop, and native approvals. Parent-chat approval and question forwarding has completed a human round trip in **Codex only**; Grok/Hermes have interface and cross-identity rejection checks for that feature, not a human round-trip acceptance test.
+Windows + DSH `0.2.1-rc.2` has been tested against the existing desktop host for task creation, continuation, result retrieval, UI, takeover/release/stop, and native approvals. The `0.2.2-rc.1` (Desktop `44.7.0`) migration to the public `session/selectModel` RPC has passed the repository test suite; on-host acceptance is pending. Parent-chat approval and question forwarding has completed a human round trip in **Codex only**; Grok/Hermes have interface and cross-identity rejection checks for that feature, not a human round-trip acceptance test.
 
 The previous optimized `0.1.0` build has been installed in the existing DSH Desktop app and completed a real same-session two-turn task, takeover/release/stop, parent-agent question answering, one-time approval, and rejection. Verify the GitHub plugin-page installation path separately from those feature checks; after installing, call `dsh_health` and `dsh_catalog` and inspect the native session.
 

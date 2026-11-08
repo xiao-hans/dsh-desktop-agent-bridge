@@ -68,6 +68,12 @@ function harness() {
           projections: { values: projections },
         }] };
         if (namespace === 'session' && method === 'create') return { sessionId: session.id };
+        if (namespace === 'session' && method === 'selectModel') {
+          const { sessionId, ...selected } = args.request;
+          append('model/selection', selected);
+          projections.modelSelection = { next: selected };
+          return { selected };
+        }
         if (namespace === 'session' && method === 'rename') return { title: args.request.title };
         if (namespace === 'workspace' && method === 'create') return {
           workspace: { workspaceId: 'workspace-2', path: args.request.path, title: '验收', sessionIds: [] },
@@ -91,16 +97,9 @@ function harness() {
     },
     sessionController: {
       resolveAgent: async () => ({ agent }),
-      agents: {
-        selectForNextRequest(agent, selection) {
-          calls.push(['selectForNextRequest', selection]);
-          append('model/selection', selection);
-          projections.modelSelection = { next: selection };
-        },
-        selectionFor: () => ({ current: projections.modelSelection.next }),
-      },
       selectModel: () => assert.fail('Never call a model setter that changes defaults.'),
     },
+    typert: { local: { get: endpoint => endpoint === 'session/selectModel' ? { endpoint } : undefined } },
     permissionPresets: {
       resolve: () => ({ sandbox: 'workspace-write', approval: 'ask' }),
       set: (session, value) => permissions.set(session.id, value),

@@ -171,7 +171,7 @@ export function createHostAdapter(ctx) {
     if (ctx.permissionPresets.current(agent.session) !== requested) {
       fail('DSH did not retain the required permission preset.');
     }
-    ctx.sessionController.agents.selectForNextRequest(agent, sessionSelection);
+    await applySelection(created.sessionId, sessionSelection);
     if (title) await invoke('session', 'rename', { request: { sessionId: created.sessionId, title } });
     await ctx.sessions.flush(agent.session);
     return { sessionId: created.sessionId, preset: presetId, selection: sessionSelection };
@@ -194,11 +194,25 @@ export function createHostAdapter(ctx) {
       model: resolved.model,
       ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }),
     };
-    // shortcut: DSH 0.2.1 controller seam; require an explicit adapter update when this method changes.
-    if (typeof ctx.sessionController.agents?.selectForNextRequest !== 'function') {
+    requireSelectModelRpc();
+    return normalized;
+  }
+
+  // DSH 0.2.2 exposes session-only model selection through the public session/selectModel RPC.
+  function requireSelectModelRpc() {
+    if (ctx.typert?.local?.get('session/selectModel') === undefined) {
       fail('This DSH version lacks the session-only model selection method.');
     }
-    return normalized;
+  }
+
+  async function applySelection(sessionId, selection) {
+    const { selected } = await invoke('session', 'selectModel', {
+      request: { sessionId, ...selection },
+    });
+    if (selected?.provider !== selection.provider || selected?.model !== selection.model) {
+      fail('DSH did not retain the requested model selection.');
+    }
+    return selected;
   }
 
   async function selectModel(sessionId, selection) {
@@ -207,9 +221,9 @@ export function createHostAdapter(ctx) {
     if (agent.status === 'running' || agent.inbox.nextTurn.length || agent.inbox.nextStep.length) {
       fail('Choose the next model after the current turn and pending inputs end.', 'SESSION_BUSY');
     }
-    ctx.sessionController.agents.selectForNextRequest(agent, normalized);
+    const selected = await applySelection(sessionId, normalized);
     await ctx.sessions.flush(agent.session);
-    return normalized;
+    return selected;
   }
 
   async function inspect(sessionId) {
@@ -322,7 +336,9 @@ export function createHostAdapter(ctx) {
     if (workspaceFrame.type !== 'baseline') fail('workspace.follow returned an incompatible baseline.');
     const workspace = workspaceFrame.value.items.find(item => item.sessionIds.includes(sessionId));
     if (!workspace) fail('This session is not attached to a DSH workspace.', 'INVALID_WORKSPACE');
-    const selection = state.selection ?? ctx.sessionController.agents.selectionFor(agent).current;
+    const selection = state.selection
+      ?? ctx.agents.get(sessionId)?.model?.current?.()
+      ?? { provider: '', model: '' };
     return {
       workspaceId: workspace.workspaceId,
       workspace: workspace.path,

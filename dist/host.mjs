@@ -20000,7 +20000,7 @@ function createHostAdapter(ctx) {
     if (ctx.permissionPresets.current(agent.session) !== requested) {
       fail("DSH did not retain the required permission preset.");
     }
-    ctx.sessionController.agents.selectForNextRequest(agent, sessionSelection);
+    await applySelection(created.sessionId, sessionSelection);
     if (title) await invoke("session", "rename", { request: { sessionId: created.sessionId, title } });
     await ctx.sessions.flush(agent.session);
     return { sessionId: created.sessionId, preset: presetId, selection: sessionSelection };
@@ -20022,10 +20022,22 @@ function createHostAdapter(ctx) {
       model: resolved.model,
       ...resolved.reasoningEffort === void 0 ? {} : { reasoningEffort: resolved.reasoningEffort }
     };
-    if (typeof ctx.sessionController.agents?.selectForNextRequest !== "function") {
+    requireSelectModelRpc();
+    return normalized;
+  }
+  function requireSelectModelRpc() {
+    if (ctx.typert?.local?.get("session/selectModel") === void 0) {
       fail("This DSH version lacks the session-only model selection method.");
     }
-    return normalized;
+  }
+  async function applySelection(sessionId, selection) {
+    const { selected } = await invoke("session", "selectModel", {
+      request: { sessionId, ...selection }
+    });
+    if (selected?.provider !== selection.provider || selected?.model !== selection.model) {
+      fail("DSH did not retain the requested model selection.");
+    }
+    return selected;
   }
   async function selectModel(sessionId, selection) {
     const normalized = await validateSelection(selection, (await catalog()).models);
@@ -20033,9 +20045,9 @@ function createHostAdapter(ctx) {
     if (agent.status === "running" || agent.inbox.nextTurn.length || agent.inbox.nextStep.length) {
       fail("Choose the next model after the current turn and pending inputs end.", "SESSION_BUSY");
     }
-    ctx.sessionController.agents.selectForNextRequest(agent, normalized);
+    const selected = await applySelection(sessionId, normalized);
     await ctx.sessions.flush(agent.session);
-    return normalized;
+    return selected;
   }
   async function inspect(sessionId) {
     const snapshot = await history(sessionId);
@@ -20143,7 +20155,7 @@ function createHostAdapter(ctx) {
     if (workspaceFrame.type !== "baseline") fail("workspace.follow returned an incompatible baseline.");
     const workspace = workspaceFrame.value.items.find((item) => item.sessionIds.includes(sessionId));
     if (!workspace) fail("This session is not attached to a DSH workspace.", "INVALID_WORKSPACE");
-    const selection = state.selection ?? ctx.sessionController.agents.selectionFor(agent).current;
+    const selection = state.selection ?? ctx.agents.get(sessionId)?.model?.current?.() ?? { provider: "", model: "" };
     return {
       workspaceId: workspace.workspaceId,
       workspace: workspace.path,
