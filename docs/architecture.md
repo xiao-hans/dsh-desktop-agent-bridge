@@ -93,4 +93,4 @@ preparing → queued → running → completed / failed / cancelled / blocked
 
 DSH 自己管理完整原生会话。插件状态使用临时文件加替换写入；这不构成加密存储，也不是跨账号隔离。卸载保留状态与 DSH 会话。
 
-已验证宿主为 Windows 上的 DSH `0.2.2-rc.1`（桌面端 `44.7.0`）。模型选择走公开的 `session/selectModel` RPC（能力探测通过 `typert.local` 注册表），父交互依赖原生事件通道，UI 使用 `sidebar.footer.action` 插槽。这些版本相关接口集中在适配器和 UI 中；不兼容时应明确报错，不回退到修改全局模型、关闭审批或启动另一个 DSH。
+适配基线为 Windows 上的 DSH `0.2.2-rc.3`（桌面端 `44.7.0`）。模型选择走公开的 `session/selectModel` RPC（能力探测通过 `typert.local` 注册表），父交互依赖原生事件通道，UI 使用 `sidebar.footer.action` 插槽。这些版本相关接口集中在适配器和 UI 中；不兼容时应明确报错，不回退到修改全局模型、关闭审批或启动另一个 DSH。

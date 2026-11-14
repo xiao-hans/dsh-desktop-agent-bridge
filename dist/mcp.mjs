@@ -36647,7 +36647,7 @@ var EMPTY_COMPLETION_RESULT = {
 
 // src/protocol.mjs
 var PACKAGE_NAME = "dsh-agent-collaboration";
-var VERSION = "0.1.2";
+var VERSION = "0.1.3";
 var id = external_exports.string().min(1).max(200);
 var clientId = external_exports.string().regex(/^[a-z][a-z0-9_-]{0,47}$/);
 var PERMISSION_MODES = ["workspace-write", "danger-full-access"];

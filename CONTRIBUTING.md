@@ -1,6 +1,6 @@
 # 贡献指南
 
-DSH Desktop Agent Bridge 当前验证基线为 Windows + DSH `0.2.2-rc.1`（桌面端 `44.7.0`）。其他平台或版本的支持需要实际验收，不能仅凭测试通过宣称兼容。
+DSH Desktop Agent Bridge 当前适配基线为 Windows + DSH `0.2.2-rc.3`（桌面端 `44.7.0`）。其他平台或版本的支持需要实际验收，不能仅凭测试通过宣称兼容。
 
 ## 本地开发
 

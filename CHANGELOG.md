@@ -1,8 +1,9 @@
 # 更新记录
 
-## Unreleased
+## 0.1.3 — DSH 0.2.2-rc.3 兼容
 
-- 兼容 DSH `0.2.2-rc.1`（桌面端 `44.7.0`）：会话模型选择从已删除的 `sessionController.agents.selectForNextRequest`/`selectionFor` 内部接口迁移到公开的 `session/selectModel` RPC，能力探测改用 `typert.local` 注册表；`engines.dsh` 同步更新。
+- 兼容 DSH `0.2.2-rc.3`（桌面端 `44.7.0`）：`engines.dsh` 从精确 `0.2.2-rc.1` 改为 `>=0.2.2-rc.1 <0.3.0-0`，覆盖 0.2.2 的 rc.1–rc.3 及后续 0.2.x 预发布版；会话模型选择继续使用公开 `session/selectModel` RPC（rc.3 参数与返回结构未变）。
+- 会话模型选择从已删除的 `sessionController.agents.selectForNextRequest`/`selectionFor` 内部接口迁移到公开的 `session/selectModel` RPC，能力探测改用 `typert.local` 注册表。
 
 - 权限模式改为按身份显式授权：客户端策略新增 `permissionModes`（默认仅 `workspace-write`）。用户可在桌面协作设置中为受信任的客户端勾选 `danger-full-access`；只有被授权的模式才允许创建或续接会话，未授权一律返回 `UNSAFE_SESSION_PERMISSIONS`，broker 层在建会话前返回 `PERMISSION_MODE_DENIED`。其余护栏（会话归属、用户接管、工作区/能力包/模型白名单、幂等冲突、父 Agent 代审批开关）不变。
 

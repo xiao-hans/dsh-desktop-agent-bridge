@@ -1,6 +1,6 @@
 # 发布与维护
 
-本项目通过 DSH 桌面端「插件 → 添加插件」从 GitHub 仓库或本地目录安装。仓库保留预构建的 `dist/*.mjs` 和 `dist/THIRD_PARTY_LICENSES.txt`；Git 安装不依赖 `prepare`，不要求用户授权安装时构建。`package.json` 的 `private: true` 防止误发 npm，不影响 DSH 从 Git 安装或本地 `npm pack`。内部包名 `dsh-agent-collaboration` 保持不变；`engines.dsh` 固定为已经验证的 `0.2.2-rc.1`（桌面端 `44.7.0`），不要在未实测的版本上放宽范围；版本升级时须先迁移并验收适配层，再同步该字段。
+本项目通过 DSH 桌面端「插件 → 添加插件」从 GitHub 仓库或本地目录安装。仓库保留预构建的 `dist/*.mjs` 和 `dist/THIRD_PARTY_LICENSES.txt`；Git 安装不依赖 `prepare`，不要求用户授权安装时构建。`package.json` 的 `private: true` 防止误发 npm，不影响 DSH 从 Git 安装或本地 `npm pack`。内部包名 `dsh-agent-collaboration` 保持不变；`engines.dsh` 采用 `>=0.2.2-rc.1 <0.3.0-0`，当前适配基线为 `0.2.2-rc.3`（桌面端 `44.7.0`）；不要放宽到 `0.3`，版本升级时须先迁移并验收适配层，再同步该字段。
 
 ## 每次发布前
 
@@ -38,7 +38,7 @@ npm pack --ignore-scripts
 需要 GitHub Release 附件时，可在人工核对 `npm pack` 产物后创建草稿，并按实际版本替换标签和文件名：
 
 ```sh
-gh release create v0.1.1 dsh-agent-collaboration-0.1.1.tgz --draft --title "v0.1.1 — Preview" --notes-file CHANGELOG.md
+gh release create v0.1.3 dsh-agent-collaboration-0.1.3.tgz --draft --title "v0.1.3 — Preview" --notes-file CHANGELOG.md
 ```
 
 本项目没有自动 npm 发布、自动创建 Release，或对用户桌面的无提示自动更新。

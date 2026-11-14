@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 export const PACKAGE_NAME = 'dsh-agent-collaboration';
-export const VERSION = '0.1.2';
+export const VERSION = '0.1.3';
 const id = z.string().min(1).max(200);
 const clientId = z.string().regex(/^[a-z][a-z0-9_-]{0,47}$/);
 // Permission modes a user may explicitly grant a client. Default stays the tightest preset.
